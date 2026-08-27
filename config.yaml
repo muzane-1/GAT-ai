@@ -1,0 +1,26 @@
+# Dataset Paths & Settings
+dataset:
+  raw_path: "data/raw/ibm_aml_transactions.csv"
+  processed_path: "data/processed/graph_data.pt"
+
+# GATv2 Model Architecture Parameters
+model:
+  in_channels: 16        # Number of node features (e.g., account stats)
+  hidden_channels: 64    # Hidden representation dimension per head
+  out_channels: 2        # Binary classes (0: Legitimate, 1: Money Laundering)
+  edge_dim: 5            # Number of transaction/edge attributes
+  heads: 4               # Attention heads count
+  dropout: 0.2           # Dropout probability
+
+# Training & Optimization Hyperparameters
+training:
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001   # L2 Regularization
+  device: "cuda"         # Use "cuda" for GPU or "cpu"
+  checkpoint_path: "checkpoints/gatv2_best_model.pt"
+
+# Loss Function Settings (Focal Loss for Class Imbalance)
+loss:
+  alpha: 0.25            # Focal loss balancing factor
+  gamma: 2.0             # Focusing parameter for hard instances
