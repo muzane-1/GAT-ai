@@ -1,83 +1,50 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.nn import GATv2Conv, LayerNorm
+"""Backward-compatible shim: re-export the refactored GATv2 architecture.
+
+Notebooks continue to do ``from src.model import GATv2`` (or the legacy
+``GATv2AMLModel``) with the original constructor signature; the underlying
+implementation lives in :class:`src.models.gatv2.GATv2Net`.
+"""
+
+from src.models.gatv2 import GATv2Net
 
 
-class GATv2(nn.Module):
+class GATv2(GATv2Net):
+    """Legacy-named wrapper matching the original notebook constructor.
+
+    Args:
+        in_channels: Node feature count.
+        hidden_channels: Channel width per layer.
+        out_channels: Output logits width (legacy name; default binary).
+        edge_dim: Edge feature dimension.
+        heads: Attention heads per layer.
+        dropout: Dropout probability.
     """
-    Professional Deep 4-Layer GATv2 Architecture for AML Fraud Detection.
-    Includes Residual Connections, Layer Normalization, and Multi-hop Attention.
-    """
 
-    def __init__(self, in_channels, hidden_channels, out_channels, edge_dim, heads=4, dropout=0.2):
-        super(GATv2, self).__init__()
-        self.dropout = dropout
-
-        # Layer 1: Input Graph Feature Encoder
-        self.conv1 = GATv2Conv(
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int,
+        out_channels: int,
+        edge_dim: int,
+        heads: int = 4,
+        dropout: float = 0.2,
+    ) -> None:
+        # Pick the largest head count (<= heads) that divides hidden_channels
+        # so concatenated heads preserve channel parity for skip connections.
+        resolved_heads = next((h for h in range(int(heads), 0, -1) if hidden_channels % h == 0), 1)
+        super().__init__(
             in_channels=in_channels,
-            out_channels=hidden_channels,
-            heads=heads,
-            concat=True,
-            edge_dim=edge_dim
-        )
-        self.norm1 = LayerNorm(hidden_channels * heads)
-
-        # Layer 2: Deep Feature Representation (Intermediate)
-        self.conv2 = GATv2Conv(
-            in_channels=hidden_channels * heads,
-            out_channels=hidden_channels,
-            heads=heads,
-            concat=True,
-            edge_dim=edge_dim
-        )
-        self.norm2 = LayerNorm(hidden_channels * heads)
-
-        # Layer 3: High-Level Multi-Hop Graph Analysis
-        self.conv3 = GATv2Conv(
-            in_channels=hidden_channels * heads,
-            out_channels=hidden_channels,
-            heads=heads,
-            concat=True,
-            edge_dim=edge_dim
-        )
-        self.norm3 = LayerNorm(hidden_channels * heads)
-
-        # Layer 4: Output Classification Layer
-        self.conv4 = GATv2Conv(
-            in_channels=hidden_channels * heads,
-            out_channels=out_channels,
-            heads=1,
-            concat=False,
-            edge_dim=edge_dim
+            hidden_channels=hidden_channels,
+            num_layers=3,
+            heads=resolved_heads,
+            dropout=dropout,
+            concat_heads=True,
+            edge_dim=edge_dim,
+            num_classes=out_channels,
         )
 
-    def forward(self, x, edge_index, edge_attr):
-        """
-        Forward propagation with Skip Connections and Layer Normalization.
-        """
-        # --- Layer 1 ---
-        x = self.conv1(x, edge_index, edge_attr=edge_attr)
-        x = self.norm1(x)
-        x = F.elu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
 
-        # --- Layer 2 (With Residual Skip Connection) ---
-        residual1 = x
-        x = self.conv2(x, edge_index, edge_attr=edge_attr)
-        x = self.norm2(x + residual1)
-        x = F.elu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
+# Legacy notebooks additionally import this historical alias.
+GATv2AMLModel = GATv2
 
-        # --- Layer 3 (With Residual Skip Connection) ---
-        residual2 = x
-        x = self.conv3(x, edge_index, edge_attr=edge_attr)
-        x = self.norm3(x + residual2)
-        x = F.elu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
-
-        # --- Layer 4 (Final Classification Readout) ---
-        x = self.conv4(x, edge_index, edge_attr=edge_attr)
-
-        return x
+__all__ = ["GATv2", "GATv2AMLModel", "GATv2Net"]

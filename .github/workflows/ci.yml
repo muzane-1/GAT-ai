@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker-pipeline:
+    name: Lint, test, and 1-epoch dry-run inside Docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t aml-gnn:ci .
+
+      - name: Lint (ruff)
+        run: docker run --rm aml-gnn:ci ruff check .
+
+      - name: Lint (format check)
+        run: docker run --rm aml-gnn:ci ruff format --check .
+
+      - name: Unit tests
+        run: docker run --rm aml-gnn:ci python -m pytest tests/ -v
+
+      - name: 1-epoch training dry-run
+        run: >-
+          docker run --rm aml-gnn:ci
+          python -m src.training.train --epochs 1
+
+      - name: Optuna smoke run (1 trial)
+        run: >-
+          docker run --rm aml-gnn:ci
+          python -m src.training.tune --trials 1 --epochs 1

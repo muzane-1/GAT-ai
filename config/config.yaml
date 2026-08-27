@@ -1,0 +1,71 @@
+# =============================================================================
+# AML Detection — Central configuration
+# =============================================================================
+# Every tunable in the system lives here. Training, tuning, and the update
+# pipeline all read this file; nothing is hard-coded in the modules.
+
+data:
+  # Either a local CSV path or an HTTP(S) URL. Falls back to synthetic
+  # generation when the source is unreachable and `fallback_generate` is true.
+  raw_source: "data/raw/transactions.csv"
+  processed_dir: "data/processed"
+  fallback_generate: true
+  fallback_n_accounts: 400
+  fallback_n_transactions: 6000
+  fallback_fraud_ratio: 0.02
+  fallback_seed: 42
+  fetch_retry_attempts: 3
+  fetch_retry_backoff_seconds: 1.0
+  fetch_timeout_seconds: 20
+  velocity_window_seconds: 86400  # 24h transactional velocity window
+
+model:
+  hidden_channels: 64
+  num_layers: 3
+  heads: 4
+  dropout: 0.30
+  # Concatenate attention heads (true) or average them (false) inside layers.
+  concat_heads: true
+  # Edge features (scaled amount, dt) are injected into each GATv2 layer.
+  use_edge_features: true
+
+loss:
+  init_alpha: 0.25
+  init_gamma: 2.0
+  # Adaptive update: alpha/gamma move toward the observed FN/FP trade-off.
+  alpha_update_rate: 0.05
+  min_alpha: 0.05
+  max_alpha: 0.95
+  min_gamma: 1.0
+  max_gamma: 5.0
+  gamma_update_rate: 0.1
+
+training:
+  epochs: 200
+  lr: 0.005
+  weight_decay: 0.0005
+  early_stopping_patience: 25
+  grad_clip_norm: 1.0
+  scheduler_factor: 0.5
+  scheduler_patience: 8
+  val_ratio: 0.15
+  test_ratio: 0.15
+  seed: 42
+
+tuning:
+  n_trials: 20
+  epochs_per_trial: 40
+  timeout_seconds: null
+  study_name: "aml-gatv2"
+  storage: ""  # e.g. "sqlite:///checkpoints/optuna.db" for resumable studies
+
+paths:
+  checkpoints_dir: "checkpoints"
+  metrics_history: "checkpoints/metrics_history.json"
+  best_checkpoint: "checkpoints/best.pt"
+
+monitoring:
+  # Metric drift thresholds (relative drop) that trigger retraining.
+  drift_metric: "pr_auc"
+  drift_threshold: 0.05
+  absolute_floor: 0.60  # retrain if primary metric falls below this value
