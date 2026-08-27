@@ -17,7 +17,8 @@ ignore = ["ANN401"]  # Any is fine in config metadata
 [tool.ruff.lint.per-file-ignores]
 "src/dataset.py" = ["ANN", "UP", "I", "E501"]
 "src/utils/legacy.py" = ["ANN", "UP", "I", "E501"]
-"notebooks/*.ipynb" = ["E501", "F401", "F841"]
+# Interactive sandbox cells commonly do sys.path mutation before imports — IPython-friendly.
+"notebooks/*.ipynb" = ["E401", "E402", "E501", "E702", "E741", "F401", "F811", "F821", "F841"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["src", "tests"]
