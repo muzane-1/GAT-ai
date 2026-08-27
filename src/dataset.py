@@ -3,7 +3,7 @@ import pandas as pd
 import torch
 from pandas.errors import EmptyDataError
 from typing import Callable, Optional
-from torch_geometric.data import InMemoryDataset
+from torch_geometric.data import Data, InMemoryDataset
 
 
 class AMLDataset(InMemoryDataset):
@@ -107,7 +107,7 @@ def ensure_loaded(root: str = "data"):
         if os.path.exists(processed):
             os.remove(processed)
 
-    for attempt in range(2):
+    for _attempt in range(2):
         try:
             return load_aml_dataset(root=root)
         except (EmptyDataError, ValueError, OSError, RuntimeError):
@@ -119,4 +119,3 @@ def ensure_loaded(root: str = "data"):
     df = generate_synthetic_transactions(n_accounts=200, n_transactions=400)
     data, _ = build_pyg_data(df)
     return data
-
