@@ -1,8 +1,9 @@
 import os
 import pandas as pd
 import torch
-from typing import Optional, Callable
-from torch_geometric.data import Data, InMemoryDataset
+from pandas.errors import EmptyDataError
+from typing import Callable, Optional
+from torch_geometric.data import InMemoryDataset
 
 
 class AMLDataset(InMemoryDataset):
@@ -90,3 +91,32 @@ class AMLDataset(InMemoryDataset):
 def load_aml_dataset(root="data"):
     dataset = AMLDataset(root=root)
     return dataset[0]
+
+
+def ensure_loaded(root: str = "data"):
+    """Load the AML graph, never raising EmptyDataError on corrupt caches.
+
+    If the cached processed graph is missing/corrupt, the cache is purged and
+    :class:`AMLDataset` rebuilds (triggering the Hugging Face or synthetic
+    fallback). As a last resort, the module generator returns a guaranteed
+    non-empty graph.
+    """
+
+    def _purge_processed_cache() -> None:
+        processed = os.path.join(root, "processed", "graph_data.pt")
+        if os.path.exists(processed):
+            os.remove(processed)
+
+    for attempt in range(2):
+        try:
+            return load_aml_dataset(root=root)
+        except (EmptyDataError, ValueError, OSError, RuntimeError):
+            _purge_processed_cache()
+    # Hard fallback on the canonical synthetic generator (smurfing motif).
+    from .data_pipeline.ingestion import generate_synthetic_transactions
+    from .data_pipeline.graph_builder import build_pyg_data
+
+    df = generate_synthetic_transactions(n_accounts=200, n_transactions=400)
+    data, _ = build_pyg_data(df)
+    return data
+
