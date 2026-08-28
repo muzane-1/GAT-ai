@@ -65,7 +65,7 @@ def load_checkpoint(filepath: str, model: torch.nn.Module, optimizer: torch.opti
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"No checkpoint found at '{filepath}'")
 
-    checkpoint = torch.load(filepath)
+    checkpoint = torch.load(filepath, weights_only=True)  # nosec B614
     model.load_state_dict(checkpoint["model_state_dict"])
     if optimizer and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

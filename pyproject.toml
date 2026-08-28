@@ -23,6 +23,19 @@ ignore = ["ANN401"]  # Any is fine in config metadata
 [tool.ruff.lint.isort]
 known-first-party = ["src", "tests"]
 
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["src/utils/legacy.py", "src/dataset.py"]  # legacy shims
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

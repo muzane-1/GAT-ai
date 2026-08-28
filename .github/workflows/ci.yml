@@ -26,8 +26,23 @@ jobs:
       - name: Lint (format check)
         run: docker run --rm aml-gnn:ci ruff format --check .
 
-      - name: Unit tests
-        run: docker run --rm aml-gnn:ci python -m pytest tests/ -v
+      - name: Static type check (mypy)
+        run: docker run --rm aml-gnn:ci mypy src/
+
+      - name: Security scan (bandit)
+        run: docker run --rm aml-gnn:ci bandit -r src/
+
+      - name: Unit tests + coverage
+        run: >-
+          docker run --rm aml-gnn:ci
+          python -m pytest --cov=src --cov-fail-under=80 tests/
+
+      - name: Notebook execution (headless)
+        # Run only 04 (the deterministic-synthetic validation notebook). 01-03
+        # depend on the in-memory HF dataset and would time out in CI.
+        run: >-
+          docker run --rm aml-gnn:ci
+          python -m nbconvert --execute notebooks/04_data_pipeline_validation.ipynb --to notebook --output-dir=/tmp/executed_notebooks
 
       - name: 1-epoch training dry-run
         run: >-
