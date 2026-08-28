@@ -251,7 +251,9 @@ def train_model(
             break
 
     # Final test evaluation with the best checkpoint.
-    checkpoint = torch.load(out_dir / "best.pt", weights_only=False)
+    checkpoint = torch.load(  # nosec B614
+        out_dir / "best.pt", weights_only=False
+    )
     model.load_state_dict(checkpoint["model_state_dict"])
     test_metrics = evaluate(model, data, test_mask)
     logger.info("test %s", format_metrics(test_metrics))

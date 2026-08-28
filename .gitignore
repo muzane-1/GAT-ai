@@ -19,4 +19,4 @@ checkpoints/
 .idea/
 .vscode/
 *.log
-.DS_StoreStore
+.DS_StoreStore.coverage

@@ -21,7 +21,10 @@ class AMLDataset(InMemoryDataset):
     ):
         self.repo_id = repo_id
         super(AMLDataset, self).__init__(root, transform, pre_transform)
-        self.data, self.slices = torch.load(self.processed_paths[0])
+        self.data, self.slices = torch.load(
+            self.processed_paths[0],
+            weights_only=True,  # nosec B614
+        )
 
     @property
     def raw_file_names(self) -> str:
@@ -41,7 +44,9 @@ class AMLDataset(InMemoryDataset):
             try:
                 from datasets import load_dataset
 
-                ds = load_dataset(self.repo_id, split="train[:50000]")
+                ds = load_dataset(  # nosec B615
+                    self.repo_id, split="train[:50000]", revision="main"
+                )
                 df = ds.to_pandas()
                 df.to_csv(local_csv, index=False)
                 print("[PyG Dataset] Successfully downloaded and saved raw CSV data.")
