@@ -6,9 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# PyTorch CPU build — keeps the image slim and CI-friendly.
+# Install deps from requirements.txt, explicitly including the new lint/CI tools.
+COPY requirements.txt ./
 RUN pip install "torch>=2.2,<2.8" --index-url https://download.pytorch.org/whl/cpu \
-    && pip install torch_geometric pandas numpy scikit-learn PyYAML requests optuna pytest ruff
+    && pip install -r requirements.txt
 
 COPY . /app
 
