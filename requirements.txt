@@ -10,6 +10,7 @@ datasets>=2.14          # legacy dataset loader (src/dataset.py)
 huggingface_hub>=0.23
 scipy>=1.10             # connectivity validation in auto_fetch
 matplotlib>=3.8         # notebook stage-4 plots
+seaborn>=0.12           # notebook visualisation imports
 pytest>=8.0
 pytest-cov>=5.0
 ruff>=0.5

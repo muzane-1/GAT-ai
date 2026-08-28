@@ -15,8 +15,14 @@ checkpoints/
 # Jupyter Notebooks
 .ipynb_checkpoints/
 
+# Test / coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
 # IDE & OS Files
 .idea/
 .vscode/
 *.log
-.DS_StoreStore.coverage
+.DS_Store
