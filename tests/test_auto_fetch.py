@@ -54,3 +54,36 @@ def test_auto_fetch_synthetic_fallback_and_pyg() -> None:
     data, _ = fetch_to_pyg(hf_query=None)
     assert data.num_nodes > 0 and data.num_edges > 0
     assert data.x is not None and data.edge_index.shape[0] == 2
+
+
+def test_evaluate_candidate_dataset() -> None:
+    from src.data_pipeline.auto_fetch import evaluate_candidate_dataset
+
+    df = pd.DataFrame(
+        {
+            "src": ["A", "B", "C"],
+            "dst": ["B", "C", "A"],
+            "amount": [10.5, 22.0, 700.0],
+            "timestamp": [1000.0, 1001.0, 1002.0],
+            "is_laundering": [0, 1, 0],
+        }
+    )
+
+    scores = evaluate_candidate_dataset(df)
+    assert "weighted_score" in scores
+    assert "schema_fit" in scores
+    assert "data_health" in scores
+    assert "graph_topology" in scores
+    assert "aml_balance" in scores
+
+
+def test_list_candidate_datasets() -> None:
+    from src.data_pipeline.auto_fetch import list_candidate_datasets
+
+    # Test with default keywords and tags
+    datasets = list_candidate_datasets()
+    assert isinstance(datasets, list)
+
+    # Test with custom keywords and tags
+    datasets = list_candidate_datasets(keywords=["aml"], tags=["finance"])
+    assert isinstance(datasets, list)

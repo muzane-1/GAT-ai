@@ -1,0 +1,34 @@
+# Anything listed here is excluded from the Docker build context and therefore
+# from the image. Keep the image lean: only source, config, tests, notebooks,
+# and dependency manifests are copied in.
+
+# VCS & CI
+.git
+.github
+.gitignore
+
+# Python / virtual envs
+.venv
+venv
+__pycache__
+**/__pycache__
+*.py[cod]
+*.pyo
+
+# Runtime / generated artifacts
+checkpoints
+data
+htmlcov
+.coverage
+.coverage.*
+
+# Local caches
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.ipynb_checkpoints
+**/.ipynb_checkpoints
+
+# OS junk
+.DS_Store
+Thumbs.db
