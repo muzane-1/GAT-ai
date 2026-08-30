@@ -13,6 +13,7 @@ src/
   model.py                  # Legacy shim re-exporting GATv2 / GATv2AMLModel
   utils/legacy.py           # Legacy FocalLoss, checkpoint helpers, compute_metrics
   data_pipeline/            # ingestion / auto_fetch / features / graph_builder
+  eval/                     # Dataset evaluation engine (schema / health / topology / scoring)
   models/                   # GATv2Net and AdaptiveFocalLoss
   training/                 # train.py (early stop, metrics) and tune.py (Optuna)
   utils/                    # logger, metrics, config loader
@@ -50,6 +51,32 @@ from src.data_pipeline import auto_fetch, fetch_to_pyg
 
 df, stats = auto_fetch(hf_query="qubit420/ibm-aml-LI-smaller")
 data, graph_stats = fetch_to_pyg(hf_query="qubit420/ibm-aml-LI-smaller")
+```
+
+## Dataset Evaluation Engine (`src.eval`)
+
+The dataset-quality logic extracted in `src/eval/` scores **raw, unsanitised**
+candidate tables *before* the ingestion pipeline makes its hard validation
+checks — this is how `auto_fetch()` ranks multiple Hugging Face candidates and
+picks the best one. Each module is a single, testable concern:
+
+| Module | Evaluator | What it measures |
+|---|---|---|
+| `src/eval/schema.py` | `evaluate_schema_fit()` | How much of the canonical schema (`tx_id, src, dst, amount, timestamp, is_laundering`) is present, mapping columns case-/whitespace-insensitively via `SCHEMA_ROLES` aliases (`source`, `target`, `value`, `label`, ...). Exposes `resolve_column()` and `CANONICAL_SCHEMA`. |
+| `src/eval/health.py` | `evaluate_data_health()` | Non-null ratio, share of strictly positive amounts, and parseable-timestamp ratio (degrades gracefully to 0 on unparseable timestamps). |
+| `src/eval/topology.py` | `evaluate_graph_topology()` | Node/edge counts, connectivity ratio (edges per node, capped at 1), AML class ratio and `aml_balance` — a useful class ratio is strictly between 0 and 0.5. |
+| `src/eval/scoring.py` | `evaluate_candidate_dataset()` | Aggregates the above into a single `weighted_score` using `WEIGHTS = {schema_fit: 0.3, data_health: 0.3, graph_topology: 0.2, aml_balance: 0.2}`, plus raw `nodes`, `edges` and `aml_ratio` metrics. |
+
+The return shape of `evaluate_candidate_dataset()` is backward compatible with
+the original `src.data_pipeline.auto_fetch` implementation, so existing callers
+(and tests) keep working.
+
+```python
+from src.eval import evaluate_candidate_dataset
+
+scores = evaluate_candidate_dataset(df_raw)
+# {'schema_fit': 1.0, 'data_health': 0.98, 'graph_topology': ...,
+#  'aml_balance': 1.0, 'weighted_score': 0.99, 'nodes': 120, ...}
 ```
 
 ## Notebooks
