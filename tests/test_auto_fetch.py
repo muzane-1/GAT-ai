@@ -250,6 +250,30 @@ def test_auto_fetch_explicit_source(monkeypatch: pytest.MonkeyPatch) -> None:
     assert list(df.columns) == CANONICAL_COLUMNS
 
 
+def test_auto_fetch_hf_query_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fetchable explicit HF dataset id is ingested directly."""
+    raw = pd.DataFrame(
+        {
+            "tx_id": [0, 1, 2],
+            "src": ["A", "B", "C"],
+            "dst": ["B", "C", "A"],
+            "amount": [10.0, 20.0, 30.0],
+            "timestamp": [1000.0, 1001.0, 1002.0],
+            "is_laundering": [0, 0, 1],
+        }
+    )
+
+    def _fake_fetch(source: str, fallback_generate: bool = True) -> pd.DataFrame:
+        assert source == "acme/canonical"
+        return raw.copy()
+
+    monkeypatch.setattr(AUTO_FETCH_MODULE, "fetch_transactions", _fake_fetch)
+
+    df, stats = auto_fetch(hf_query="acme/canonical")
+    assert stats["provenance"] == "hf:acme/canonical"
+    assert stats["rows"] == 3
+
+
 def test_auto_fetch_hf_failure_falls_back_to_synthetic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -323,3 +347,151 @@ def test_auto_fetch_fallback_disabled_raises(monkeypatch: pytest.MonkeyPatch) ->
 
     with pytest.raises(RuntimeError, match="fallback is disabled"):
         auto_fetch(hf_query=None, fallback_generate=False)
+
+
+def test_list_candidate_datasets_merges_extra_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """repo_ids / local_paths / synthetic_ids are merged onto HF results."""
+    from src.data_pipeline.auto_fetch import list_candidate_datasets
+
+    api = mock.Mock()
+    api.list_datasets.return_value = [mock.Mock(id="owner/ds-a")]
+    _install_fake_hf(monkeypatch, api)
+
+    datasets = list_candidate_datasets(
+        repo_ids=["owner/ds-b"],
+        local_paths=["data/raw/transactions.csv"],
+        synthetic_ids=["tiny"],
+    )
+    assert datasets == [
+        "owner/ds-a",
+        "owner/ds-b",
+        "data/raw/transactions.csv",
+        "synthetic:tiny",
+    ]
+
+
+def test_list_candidate_datasets_api_failure_still_returns_extras(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An HF API failure degrades to the configured explicit sources."""
+    from src.data_pipeline.auto_fetch import list_candidate_datasets
+
+    api = mock.Mock()
+    api.list_datasets.side_effect = RuntimeError("no network")
+    _install_fake_hf(monkeypatch, api)
+
+    datasets = list_candidate_datasets(
+        repo_ids=["owner/z"], local_paths=["x.csv"], synthetic_ids=["s"]
+    )
+    assert datasets == ["owner/z", "x.csv", "synthetic:s"]
+
+
+def test_auto_fetch_sources_synthetic_selected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A configured synthetic source is evaluated and selected via discovery."""
+    monkeypatch.setattr(
+        AUTO_FETCH_MODULE,
+        "list_candidate_datasets",
+        lambda **kwargs: ["synthetic:tiny"],
+    )
+    df, stats = auto_fetch(
+        sources=["synthetic:tiny"],
+        synthetic_sources={"tiny": {"n_accounts": 20, "n_transactions": 80}},
+    )
+    assert stats["provenance"] == "synthetic:tiny"
+    assert stats["rows"] > 0
+    assert set(df["is_laundering"].unique()).issubset({0, 1})
+
+
+def test_auto_fetch_sources_local_path_selected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A local CSV path source is routed through fetch_transactions."""
+    raw = pd.DataFrame(
+        {
+            "tx_id": [0, 1, 2],
+            "src": ["A", "B", "C"],
+            "dst": ["B", "C", "A"],
+            "amount": [10.0, 20.0, 30.0],
+            "timestamp": [1000.0, 1001.0, 1002.0],
+            "is_laundering": [0, 0, 1],  # aml_ratio 1/3 passes the hard check
+        }
+    )
+
+    def _fake_fetch(source: str, fallback_generate: bool = True) -> pd.DataFrame:
+        assert source == "data/raw/transactions.csv"
+        return raw.copy()
+
+    monkeypatch.setattr(AUTO_FETCH_MODULE, "fetch_transactions", _fake_fetch)
+    monkeypatch.setattr(AUTO_FETCH_MODULE, "list_candidate_datasets", lambda **kwargs: [])
+
+    df, stats = auto_fetch(sources=["data/raw/transactions.csv"])
+    assert stats["provenance"] == "source:data/raw/transactions.csv"
+    assert stats["rows"] == 3
+
+
+def test_auto_fetch_sources_ranked_by_score(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Candidates are sorted by weighted score; best valid one is selected."""
+    good = pd.DataFrame(
+        {
+            "tx_id": [0, 1, 2],
+            "src": ["A", "B", "C"],
+            "dst": ["B", "C", "A"],
+            "amount": [10.5, 22.0, 700.0],
+            "timestamp": [1000.0, 1001.0, 1002.0],
+            "is_laundering": [0, 1, 0],
+        }
+    )
+    poor = good.copy()
+    poor["is_laundering"] = 1  # aml_ratio == 1.0 fails the hard check
+
+    frames = {"acme/good": good, "acme/poor": poor}
+
+    def _fake_fetch(source: str, fallback_generate: bool = True) -> pd.DataFrame:
+        return frames[source].copy()
+
+    monkeypatch.setattr(AUTO_FETCH_MODULE, "fetch_transactions", _fake_fetch)
+    monkeypatch.setattr(
+        AUTO_FETCH_MODULE,
+        "list_candidate_datasets",
+        lambda **kwargs: ["acme/good", "acme/poor"],
+    )
+
+    df, stats = auto_fetch(sources=["acme/poor", "acme/good"])
+    assert stats["provenance"] == "hf:acme/good"
+    assert stats["rows"] == 3
+
+
+def test_auto_fetch_sources_all_fail_validation_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Candidates that fail sanitation fall through to the synthetic generator."""
+    monkeypatch.setattr(AUTO_FETCH_MODULE, "list_candidate_datasets", lambda **kwargs: [])
+
+    def _fake_fetch(source: str, fallback_generate: bool = True) -> pd.DataFrame:
+        # No amount column -> every row is dropped by sanitize -> validate raises.
+        return pd.DataFrame({"source": ["A"], "target": ["B"]})
+
+    monkeypatch.setattr(AUTO_FETCH_MODULE, "fetch_transactions", _fake_fetch)
+
+    df, stats = auto_fetch(sources=["data/broken.csv"])
+    assert stats["provenance"] == "synthetic"
+    assert stats["rows"] > 0
+
+
+def test_fetch_to_pyg_threads_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    """fetch_to_pyg stays compatible while forwarding the new source params."""
+    monkeypatch.setattr(
+        AUTO_FETCH_MODULE,
+        "list_candidate_datasets",
+        lambda **kwargs: ["synthetic:tiny"],
+    )
+
+    data, stats = fetch_to_pyg(
+        sources=["synthetic:tiny"],
+        synthetic_sources={"tiny": {"n_accounts": 20, "n_transactions": 80}},
+    )
+    assert data.num_nodes > 0
+    assert data.num_edges > 0
+    assert data.x is not None and data.edge_index.shape[0] == 2
+    assert stats["provenance"] == "synthetic:tiny"
+    assert stats["num_node_features"] == 9

@@ -21,6 +21,7 @@ callers (training, CI, notebooks) never see a hard crash.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -31,6 +32,7 @@ from src.data_pipeline.ingestion import (
     fetch_transactions,
     generate_synthetic_transactions,
 )
+from src.eval.scoring import evaluate_candidate_dataset
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -45,19 +47,31 @@ def list_candidate_datasets(
     tags: list[str] | None = None,
     author: str | None = None,
     limit: int = 20,
+    repo_ids: list[str] | None = None,
+    local_paths: list[str] | None = None,
+    synthetic_ids: list[str] | None = None,
 ) -> list[str]:
-    """Query Hugging Face for AML-flavoured transaction datasets using dynamic keywords and tags.
+    """Discover candidate AML-flavoured transaction datasets.
+
+    Queries the Hugging Face Hub across the given keywords/tags and, on top of
+    that, merges an explicit array of extra sources onto the discovery results:
+    HF repository ids (``"owner/repo"``), local CSV paths
+    (``"data/raw/transactions.csv"``) and synthetic generator specs
+    (``"synthetic:boosted"``) are all treated as first-class candidates.
 
     Args:
-        keywords: List of keywords to search for in dataset names/cards.
-        tags: List of tags to filter datasets.
+        keywords: Search keywords for dataset names/cards.
+        tags: Search tags to filter datasets.
         author: Optional user/org filter (e.g. ``"qubit420"``).
-        limit: Maximum number of dataset IDs to return.
+        limit: Maximum number of HF datasets to return.
+        repo_ids: Extra Hugging Face repository identifiers to include.
+        local_paths: Extra local CSV paths to include as candidates.
+        synthetic_ids: Synthetic generator spec names (e.g. ``"default"``).
 
     Returns:
-        A list of ``"<owner>/<repo>"`` identifiers, best-match first. An
-        empty list on any API error so downstream logic falls through to the
-        local / synthetic paths.
+        A list of ``"<owner>/<repo>"`` identifiers and configured extra
+        sources, best-match first. Empty on any API error so downstream
+        logic falls through to the local / synthetic paths.
     """
     keywords = keywords or DEFAULT_KEYWORDS
     tags = tags or DEFAULT_TAGS
@@ -68,10 +82,20 @@ def list_candidate_datasets(
         api = HfApi()
         query = " ".join(keywords + tags)
         rows = api.list_datasets(search=query, author=author, limit=limit)
-        return [row.id for row in rows]
+        datasets = [row.id for row in rows]
     except Exception as exc:  # network, auth, or hub rate-limit
         logger.warning("hf_dataset_discovery_failed", extra={"error": str(exc)})
-        return []
+        datasets = []
+
+    extras = [
+        *(repo_ids or []),
+        *(local_paths or []),
+        *(f"synthetic:{spec}" for spec in (synthetic_ids or [])),
+    ]
+    for extra in extras:
+        if extra not in datasets:
+            datasets.append(extra)
+    return datasets
 
 
 def _canonicalise(df: pd.DataFrame) -> pd.DataFrame:
@@ -85,114 +109,6 @@ def _canonicalise(df: pd.DataFrame) -> pd.DataFrame:
         if alias.lower() in lower_map:
             df = df.rename(columns={lower_map[alias.lower()]: canonical})
     return df
-
-
-def evaluate_candidate_dataset(df_raw: pd.DataFrame) -> dict[str, float]:
-    """Evaluate a candidate dataset using a weighted quality score.
-
-    Args:
-        df_raw: Raw transaction DataFrame to evaluate.
-
-        Returns:
-        A dictionary containing the evaluation scores and metrics.
-    """
-    from src.data_pipeline.ingestion import _COLUMN_ALIASES
-
-    df = df_raw.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    # Schema Fit: Check for canonical columns or aliases
-    schema_fit_score = 0.0
-    canonical_columns_present = [col for col in CANONICAL_COLUMNS if col in df.columns]
-    alias_columns_present = [alias for alias in _COLUMN_ALIASES if alias in df.columns]
-    schema_fit_score = (len(canonical_columns_present) + len(alias_columns_present)) / len(
-        CANONICAL_COLUMNS
-    )
-
-    # Data Health: Non-null ratio, positive amounts, valid timestamps
-    non_null_ratio = df.notna().mean().mean()
-    positive_amount_ratio = 0.0
-    valid_timestamp_ratio = 0.0
-
-    if "amount" in df.columns or any(alias in df.columns for alias in ["value"]):
-        amount_col = (
-            "amount"
-            if "amount" in df.columns
-            else [alias for alias in ["value"] if alias in df.columns][0]
-        )
-        df["amount"] = pd.to_numeric(df[amount_col], errors="coerce")
-        positive_amount_ratio = (df["amount"] > 0).mean()
-
-    if "timestamp" in df.columns or any(alias in df.columns for alias in ["timestamp_seconds"]):
-        timestamp_col = (
-            "timestamp"
-            if "timestamp" in df.columns
-            else [alias for alias in ["timestamp_seconds"] if alias in df.columns][0]
-        )
-        try:
-            df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
-            valid_timestamp_ratio = df[timestamp_col].notna().mean()
-        except Exception:
-            valid_timestamp_ratio = 0.0
-
-    data_health_score = (non_null_ratio + positive_amount_ratio + valid_timestamp_ratio) / 3
-
-    # Graph Topology & Balance: Node/edge counts, connectivity, AML class ratio
-    graph_topology_score = 0.0
-    aml_balance_score = 0.0
-
-    src_col = "src" if "src" in df.columns else ("source" if "source" in df.columns else None)
-    dst_col = "dst" if "dst" in df.columns else ("target" if "target" in df.columns else None)
-
-    if src_col and dst_col:
-        nodes = pd.concat([df[src_col], df[dst_col]]).nunique()
-        edges = len(df)
-
-        if nodes > 0 and edges > 0:
-            connectivity_ratio = min(1.0, edges / nodes)
-            graph_topology_score = (nodes + edges + connectivity_ratio) / 3
-
-    if "is_laundering" in df.columns or any(
-        alias in df.columns for alias in ["label", "laundering"]
-    ):
-        aml_col = (
-            "is_laundering"
-            if "is_laundering" in df.columns
-            else [alias for alias in ["label", "laundering"] if alias in df.columns][0]
-        )
-        df[aml_col] = pd.to_numeric(df[aml_col], errors="coerce").fillna(0)
-        aml_ratio = df[aml_col].mean()
-
-        if 0 < aml_ratio < 0.5:
-            aml_balance_score = 1.0
-        else:
-            aml_balance_score = max(0.0, 1.0 - abs(aml_ratio - 0.25) / 0.25)
-
-    # Weighted quality score
-    weights = {
-        "schema_fit": 0.3,
-        "data_health": 0.3,
-        "graph_topology": 0.2,
-        "aml_balance": 0.2,
-    }
-
-    weighted_score = (
-        schema_fit_score * weights["schema_fit"]
-        + data_health_score * weights["data_health"]
-        + graph_topology_score * weights["graph_topology"]
-        + aml_balance_score * weights["aml_balance"]
-    )
-
-    return {
-        "schema_fit": schema_fit_score,
-        "data_health": data_health_score,
-        "graph_topology": graph_topology_score,
-        "aml_balance": aml_balance_score,
-        "weighted_score": weighted_score,
-        "nodes": int(nodes) if "nodes" in locals() else 0,
-        "edges": edges if "edges" in locals() else 0,
-        "aml_ratio": aml_ratio if "aml_ratio" in locals() else 0.0,
-    }
 
 
 def sanitize_transactions(df: pd.DataFrame) -> pd.DataFrame:
@@ -286,11 +202,36 @@ def validate_transactions(df: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def _spec_kind(spec: str) -> str:
+    """Classify a candidate source spec: synthetic / path / hf."""
+    lower = spec.lower()
+    if lower == "synthetic" or lower.startswith("synthetic:"):
+        return "synthetic"
+    if (
+        lower.startswith(("http://", "https://"))
+        or Path(spec).suffix.lower() == ".csv"
+        or Path(spec).exists()
+    ):
+        return "path"
+    return "hf"
+
+
+def _load_candidate(spec: str, synthetic_sources: dict[str, dict[str, Any]] | None) -> pd.DataFrame:
+    """Load a single candidate source: HF repo, local path, or synthetic."""
+    if _spec_kind(spec) == "synthetic":
+        name = spec.split(":", 1)[1] if ":" in spec else "default"
+        kwargs = (synthetic_sources or {}).get(name, {})
+        return generate_synthetic_transactions(**kwargs)
+    return fetch_transactions(source=spec, fallback_generate=False)
+
+
 def auto_fetch(
     source: str | None = None,
     hf_query: str | None = None,
     hf_keywords: list[str] | None = None,
     hf_tags: list[str] | None = None,
+    sources: list[str] | None = None,
+    synthetic_sources: dict[str, dict[str, Any]] | None = None,
     normalize_amounts: bool = True,
     fallback_generate: bool = True,
     **builder_kwargs: Any,
@@ -300,8 +241,11 @@ def auto_fetch(
     Resolution order:
     1. Explicit ``source`` (local CSV path or HTTP URL).
     2. Explicit Hugging Face dataset id (``hf_query``).
-    3. Dynamic discovery of Hugging Face datasets using keywords and tags.
-    4. Deterministic synthetic generator.
+    3. Dynamic discovery of Hugging Face datasets (keywords/tags) merged with
+       any explicit ``sources`` array — HF repo ids, local CSV paths and
+       ``synthetic:<name>`` specs. Candidates are ranked by weighted score and
+       the highest-scoring one that passes hard validation checks is selected.
+    4. Deterministic synthetic generator (if quality gates all fail).
 
     Returns:
         ``(canonical_transactions, stats_dict)`` — the stats are produced by
@@ -328,6 +272,9 @@ def auto_fetch(
             tags=hf_tags or DEFAULT_TAGS,
             limit=20,
         )
+        for spec in sources or []:
+            if spec not in candidate_datasets:
+                candidate_datasets.append(spec)
 
         if candidate_datasets:
             logger.info(f"Discovered {len(candidate_datasets)} candidate datasets")
@@ -336,7 +283,7 @@ def auto_fetch(
             evaluated_datasets = []
             for dataset_id in candidate_datasets:
                 try:
-                    df_raw = fetch_transactions(source=dataset_id, fallback_generate=False)
+                    df_raw = _load_candidate(dataset_id, synthetic_sources)
                     evaluation_scores = evaluate_candidate_dataset(df_raw)
                     evaluated_datasets.append((dataset_id, evaluation_scores, df_raw))
                     logger.info(
@@ -366,7 +313,13 @@ def auto_fetch(
                             and stats["nodes"] > 0
                             and 0 < stats["aml_ratio"] < 0.5
                         ):
-                            provenance = f"hf:{dataset_id}"
+                            kind = _spec_kind(dataset_id)
+                            if kind == "synthetic":
+                                # Spec already carries the synthetic: prefix.
+                                provenance = dataset_id
+                            else:
+                                label = {"path": "source", "hf": "hf"}[kind]
+                                provenance = f"{label}:{dataset_id}"
                             logger.info(
                                 f"Selected highest-scoring dataset {dataset_id} "
                                 f"with score {evaluation_scores['weighted_score']:.3f}"
@@ -409,6 +362,8 @@ def fetch_to_pyg(
     hf_query: str | None = None,
     hf_keywords: list[str] | None = None,
     hf_tags: list[str] | None = None,
+    sources: list[str] | None = None,
+    synthetic_sources: dict[str, dict[str, Any]] | None = None,
     **builder_kwargs: Any,
 ) -> tuple[Any, dict[str, Any]]:
     """Fetch and convert to a PyG ``Data`` object via the canonical builder.
@@ -424,6 +379,8 @@ def fetch_to_pyg(
         hf_query=hf_query,
         hf_keywords=hf_keywords,
         hf_tags=hf_tags,
+        sources=sources,
+        synthetic_sources=synthetic_sources,
         **builder_kwargs,
     )
     data, _ = build_pyg_data(df)
