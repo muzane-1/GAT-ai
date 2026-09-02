@@ -40,8 +40,9 @@ COPY . /app
 # writable during CI runs.
 RUN groupadd --system appuser \
     && useradd --system --gid appuser --home-dir /home/appuser --shell /bin/bash appuser \
-    && mkdir -p /app/checkpoints /app/data/processed \
-    && chown -R appuser:appuser /app
+    && mkdir -p /home/appuser /app/checkpoints /app/data/processed \
+    && chown -R appuser:appuser /home/appuser /app \
+    && chmod 700 /home/appuser
 USER appuser
 
 # Default entrypoint: train the GATv2 AML detector. Override with any CI step,
