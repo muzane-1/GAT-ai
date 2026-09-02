@@ -8,15 +8,29 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_RETRIES=10 \
+    PIP_DEFAULT_TIMEOUT=120
 
-# Install dependencies in their own layer so source edits reuse the cache.
+# Install dependencies in their own layers so source edits reuse the cache.
+# Layer 1: install the small SymPy prerequisite separately so the CPU Torch
+# wheel layer remains cacheable.
 COPY requirements.txt ./
-# Pin an explicit CPU torch wheel first; `torch>=2.2,<2.8` in requirements.txt
-# is then already satisfied and pip skips the multi-GB PyPI wheel.
-RUN pip install "torch>=2.2,<2.8" --index-url https://download.pytorch.org/whl/cpu \
-    && pip install -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install "mpmath>=1.3,<2"
+# Layer 2: pin an explicit CPU torch wheel first; `torch>=2.2,<2.8` in
+# requirements.txt is then already satisfied and pip skips the multi-GB
+# PyPI wheel. mpmath (sympy dependency) is already installed from layer 1.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install "torch==2.7.1+cpu" --index-url https://download.pytorch.org/whl/cpu
+# NeighborLoader requires a compiled sampling backend. Install the CPU wheel
+# matching the supported Torch 2.7 series used by the image.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install pyg_lib \
+    -f https://data.pyg.org/whl/torch-2.7.0+cpu.html
+# Layer 3: everything else.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
 
 WORKDIR /app
 COPY . /app

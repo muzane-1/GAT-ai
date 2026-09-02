@@ -26,3 +26,4 @@ htmlcov/
 .vscode/
 *.log
 .DS_Store
+wheels/
