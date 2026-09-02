@@ -26,8 +26,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # NeighborLoader requires a compiled sampling backend. Install the CPU wheel
 # matching the supported Torch 2.7 series used by the image.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install pyg_lib \
-    -f https://data.pyg.org/whl/torch-2.7.0+cpu.html
+    sh -c '(pip install pyg_lib -f https://data.pyg.org/whl/torch-2.7.0+cpu.html) \
+        || (apt-get update && apt-get install -y --no-install-recommends cargo git build-essential cmake ninja-build pkg-config \
+            && pip install ninja wheel cmake setuptools \
+            && pip install --no-build-isolation "pyg-lib @ git+https://github.com/pyg-team/pyg-lib.git@0.5.0")'
 # Layer 3: everything else.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt
