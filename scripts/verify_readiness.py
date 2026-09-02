@@ -50,14 +50,16 @@ def dry_run(
     the exact pipeline contract (shape checks, finite loss values, optimizer
     update, and checkpoint round-trip integrity).
     """
-    config = _load_config(config_path)
+    _ = _load_config(config_path)
     data, stats = fetch_to_pyg(hf_query=None, source=None)
     if not hasattr(data, "x") or not hasattr(data, "edge_index"):
         raise RuntimeError("fetch_to_pyg returned a graph without x/edge_index tensors")
     if data.x.dim() != 2:
         raise ValueError(f"Expected x to be 2D, received {tuple(data.x.shape)}")
     if data.edge_index.dim() != 2 or data.edge_index.shape[0] != 2:
-        raise ValueError(f"Expected edge_index shape (2, E), received {tuple(data.edge_index.shape)}")
+        raise ValueError(
+            f"Expected edge_index shape (2, E), received {tuple(data.edge_index.shape)}"
+        )
     if data.edge_attr is not None and data.edge_attr.dim() != 2:
         raise ValueError(f"Expected edge_attr to be 2D, received {tuple(data.edge_attr.shape)}")
     if data.y.dim() != 1 or data.y.shape[0] != data.num_nodes:
@@ -98,7 +100,7 @@ def dry_run(
     grad_norm = 0.0
     checks: dict[str, bool] = {}
 
-    for epoch in range(max(1, int(epochs))):
+    for _epoch in range(max(1, int(epochs))):
         model.train()
         for batch in loader:
             mini_batches += 1
@@ -110,28 +112,38 @@ def dry_run(
 
             checks["x_shape"] = x.dim() == 2 and x.shape[0] > 0
             checks["edge_index_shape"] = edge_index.dim() == 2 and edge_index.shape[0] == 2
-            checks["edge_attr_shape"] = edge_attr.dim() == 2 and edge_attr.shape[0] == edge_index.shape[1]
+            checks["edge_attr_shape"] = (
+                edge_attr.dim() == 2 and edge_attr.shape[0] == edge_index.shape[1]
+            )
             checks["y_shape"] = y.dim() == 1 and y.shape[0] == x.shape[0]
             if not all(checks.values()):
                 raise ValueError(f"Tensor alignment check failed: {checks}")
 
             logits = model(x, edge_index, edge_attr)
-            checks["forward_pass"] = logits.dim() == 2 and logits.shape[-1] == 2 and logits.shape[0] == x.shape[0]
+            checks["forward_pass"] = (
+                logits.dim() == 2 and logits.shape[-1] == 2 and logits.shape[0] == x.shape[0]
+            )
             if not checks["forward_pass"]:
                 raise ValueError(f"Unexpected logits shape: {tuple(logits.shape)}")
 
             focal_loss = criterion(logits, y)
             weighted_bce, _ = _weighted_bce(logits, y)
-            checks["loss_finite"] = torch.isfinite(focal_loss).item() and torch.isfinite(weighted_bce).item()
+            checks["loss_finite"] = (
+                torch.isfinite(focal_loss).item() and torch.isfinite(weighted_bce).item()
+            )
             if not checks["loss_finite"]:
-                raise ValueError(f"Non-finite loss encountered: focal={focal_loss}, weighted_bce={weighted_bce}")
+                raise ValueError(
+                    f"Non-finite loss encountered: focal={focal_loss}, weighted_bce={weighted_bce}"
+                )
 
             last_focal = float(focal_loss.item())
             last_weighted_bce = float(weighted_bce.item())
             total_loss = 0.5 * (focal_loss + weighted_bce)
             optimizer.zero_grad()
             total_loss.backward()
-            grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item())
+            grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
+            )
             optimizer.step()
             checks["optimizer_step"] = True
             checks["backward_pass"] = True
@@ -168,7 +180,9 @@ def dry_run(
     }
 
     print("Dry-run summary")
-    print(f"- graph: {graph['nodes']} nodes / {graph['edges']} edges / {graph['features']} features")
+    print(
+        f"- graph: {graph['nodes']} nodes / {graph['edges']} edges / {graph['features']} features"
+    )
     print(f"- loader: {mini_batches} mini-batches processed")
     print(f"- losses: focal={last_focal:.6f}, weighted_bce={last_weighted_bce:.6f}")
     print(f"- grad_norm={grad_norm:.6f}, state_match={state_match}, cleaned={cleaned}")
@@ -178,10 +192,24 @@ def dry_run(
 
 def _cli() -> None:
     parser = argparse.ArgumentParser(description="Run the pre-training GATv2 readiness smoke test.")
-    parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to the YAML config file")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/test_model.pt", help="Checkpoint path for the dummy save/reload check")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config/config.yaml",
+        help="Path to the YAML config file",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="checkpoints/test_model.pt",
+        help="Checkpoint path for the dummy save/reload check",
+    )
     parser.add_argument("--epochs", type=int, default=1, help="Number of dry-run epochs to execute")
-    parser.add_argument("--keep-checkpoint", action="store_true", help="Keep the temporary checkpoint instead of deleting it")
+    parser.add_argument(
+        "--keep-checkpoint",
+        action="store_true",
+        help="Keep the temporary checkpoint instead of deleting it",
+    )
     args = parser.parse_args()
     dry_run(
         config_path=args.config,
