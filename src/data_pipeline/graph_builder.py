@@ -15,6 +15,10 @@ from sklearn.preprocessing import StandardScaler
 from torch_geometric.data import Data
 
 from src.data_pipeline import features as feature_module
+from src.data_pipeline.positional_encoding import (
+    laplacian_positional_encoding,
+    random_walk_structural_encoding,
+)
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -32,6 +36,8 @@ def build_pyg_data(
     df: pd.DataFrame,
     velocity_window_seconds: float = 86400.0,
     scaler: StandardScaler | None = None,
+    lap_pe_dim: int = 8,
+    rw_pe_dim: int = 8,
 ) -> tuple[Data, StandardScaler]:
     """Build a PyG ``Data`` object from a canonical transaction table.
 
@@ -71,7 +77,14 @@ def build_pyg_data(
         np.stack([amounts, norm_ts], axis=1), dtype=torch.float32
     )  # shape (E, 2)
 
-    data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+    data = Data(
+        x=x,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        y=y,
+        lap_pe=laplacian_positional_encoding(edge_index, x.size(0), lap_pe_dim),
+        rw_pe=random_walk_structural_encoding(edge_index, x.size(0), rw_pe_dim),
+    )
     logger.info(
         "Built graph: %d nodes, %d edges, %d node features, %d edge features",
         data.num_nodes,

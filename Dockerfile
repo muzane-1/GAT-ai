@@ -4,7 +4,7 @@
 # bandit, pytest --cov, nbconvert, 1-epoch train, Optuna smoke) runs inside
 # `docker run --rm aml-gnn:ci <cmd>`. Keep the base minimal (no CUDA) so the
 # wheel downloads stay small and the layer cache stays warm.
-FROM python:3.11-slim
+FROM python:3.11-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -37,6 +37,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 WORKDIR /app
 COPY . /app
 
+FROM base AS test
+CMD ["python", "-m", "pytest", "tests/"]
+
+FROM base AS trainer
+
 # Run as an unprivileged user. /app is owned by the app user so runtime
 # artifacts (checkpoints/, metrics history, pytest/ruff/mypy caches) stay
 # writable during CI runs.
@@ -47,6 +52,6 @@ RUN groupadd --system appuser \
     && chmod 700 /home/appuser
 USER appuser
 
-# Default entrypoint: train the GATv2 AML detector. Override with any CI step,
+# Default entrypoint: train the AML detector. Override with any CI step,
 # e.g. `docker run --rm aml-gnn:ci pytest tests/` or `ruff check .`.
 CMD ["python", "-m", "src.training.train"]

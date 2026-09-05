@@ -16,7 +16,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 import yaml
-from torch_geometric.loader import NeighborLoader
+from torch_geometric import typing as pyg_typing
+from torch_geometric.loader import DataLoader, NeighborLoader
 
 from src.data_pipeline import fetch_to_pyg
 from src.models import AdaptiveFocalLoss, GATv2Net
@@ -85,13 +86,18 @@ def dry_run(
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=5e-4)
 
     batch_size = min(32, max(1, data.num_nodes))
-    loader = NeighborLoader(
-        data,
-        input_nodes=torch.arange(min(data.num_nodes, 128), dtype=torch.long),
-        batch_size=batch_size,
-        num_neighbors=[8, 4],
-        shuffle=True,
-    )
+    if pyg_typing.WITH_PYG_LIB or pyg_typing.WITH_TORCH_SPARSE:
+        loader = NeighborLoader(
+            data,
+            input_nodes=torch.arange(min(data.num_nodes, 128), dtype=torch.long),
+            batch_size=batch_size,
+            num_neighbors=[8, 4],
+            shuffle=True,
+        )
+    else:
+        # NeighborLoader needs pyg-lib or torch-sparse; keep the readiness
+        # check runnable in the lightweight CPU development environment.
+        loader = DataLoader([data], batch_size=1, shuffle=True)
 
     mini_batches = 0
     final_batch = None

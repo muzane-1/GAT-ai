@@ -16,9 +16,10 @@ from typing import Any
 import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
+from torch import nn
 
 from src.data_pipeline import build_pyg_data, fetch_transactions
-from src.models import AdaptiveFocalLoss, GATv2Net
+from src.models import AdaptiveFocalLoss, GATv2GraphTransformer, GATv2Net
 from src.utils import format_metrics, get_logger, load_config
 from src.utils.metrics import compute_metrics
 
@@ -63,7 +64,7 @@ def make_masks(y: torch.Tensor, val_ratio: float, test_ratio: float, seed: int) 
 
 
 def evaluate(
-    model: GATv2Net,
+    model: nn.Module,
     data: Any,
     mask: torch.Tensor,
 ) -> dict[str, float]:
@@ -81,9 +82,18 @@ def evaluate(
     """
     model.eval()
     with torch.no_grad():
-        probs = model.predict_prob(data.x, data.edge_index, data.edge_attr)
-    y_true = data.y[mask].numpy()
-    y_prob = probs[mask].numpy()
+        if isinstance(model, GATv2GraphTransformer):
+            probs = model.predict_prob(
+                data.x,
+                data.edge_index,
+                data.edge_attr,
+                getattr(data, "lap_pe", None),
+                getattr(data, "rw_pe", None),
+            )
+        else:
+            probs = model.predict_prob(data.x, data.edge_index, data.edge_attr)
+    y_true = data.y[mask].detach().cpu().numpy()
+    y_prob = probs[mask].detach().cpu().numpy()
 
     metrics = compute_metrics(y_true, y_prob)
     positives = y_true == 1
@@ -151,15 +161,27 @@ def train_model(
     )
 
     edge_dim = int(data.edge_attr.shape[1]) if model_cfg.get("use_edge_features", True) else None
-    model = GATv2Net(
-        in_channels=data.num_features,
-        hidden_channels=model_cfg["hidden_channels"],
-        num_layers=model_cfg["num_layers"],
-        heads=model_cfg["heads"],
-        dropout=model_cfg["dropout"],
-        concat_heads=model_cfg.get("concat_heads", True),
-        edge_dim=edge_dim,
-    )
+    if model_cfg.get("architecture", "gatv2") == "hybrid":
+        model: nn.Module = GATv2GraphTransformer(
+            in_channels=data.num_features,
+            hidden_channels=model_cfg["hidden_channels"],
+            num_layers=model_cfg["num_layers"],
+            heads=model_cfg["heads"],
+            dropout=model_cfg["dropout"],
+            edge_dim=edge_dim,
+            lap_pe_dim=data.lap_pe.size(1),
+            rw_pe_dim=data.rw_pe.size(1),
+        )
+    else:
+        model = GATv2Net(
+            in_channels=data.num_features,
+            hidden_channels=model_cfg["hidden_channels"],
+            num_layers=model_cfg["num_layers"],
+            heads=model_cfg["heads"],
+            dropout=model_cfg["dropout"],
+            concat_heads=model_cfg.get("concat_heads", True),
+            edge_dim=edge_dim,
+        )
     criterion = AdaptiveFocalLoss(
         init_alpha=loss_cfg["init_alpha"],
         init_gamma=loss_cfg["init_gamma"],
@@ -175,16 +197,38 @@ def train_model(
         lr=train_cfg["lr"],
         weight_decay=train_cfg.get("weight_decay", 5e-4),
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=train_cfg.get("scheduler_factor", 0.5),
-        patience=train_cfg.get("scheduler_patience", 8),
-    )
-
     max_epochs = int(epochs or train_cfg["epochs"])
     patience = train_cfg["early_stopping_patience"]
     clip_norm = train_cfg.get("grad_clip_norm", 1.0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    data = data.to(device)
+    train_mask, val_mask, test_mask = (
+        train_mask.to(device),
+        val_mask.to(device),
+        test_mask.to(device),
+    )
+    amp_enabled = bool(train_cfg.get("amp", True) and device.type == "cuda")
+    scaler_amp = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    warmup_epochs = min(int(train_cfg.get("warmup_epochs", 5)), max_epochs)
+    min_lr = float(train_cfg.get("scheduler_min_lr", 1e-5))
+
+    def schedule(epoch: int) -> float:
+        if epoch <= warmup_epochs:
+            return epoch / max(warmup_epochs, 1)
+        progress = (epoch - warmup_epochs) / max(max_epochs - warmup_epochs, 1)
+        return (min_lr / train_cfg["lr"]) + (1 - min_lr / train_cfg["lr"]) * (
+            1 + np.cos(np.pi * progress)
+        ) / 2
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
+    mlflow_run = None
+    if config.get("tracking", {}).get("enabled", False):
+        import mlflow
+
+        mlflow.set_experiment(config["tracking"].get("experiment_name", "aml-gnn"))
+        mlflow_run = mlflow.start_run()
+        mlflow.log_params({"architecture": model_cfg.get("architecture", "gatv2"), **train_cfg})
 
     history: list[dict[str, Any]] = []
     best_val_pr_auc = -1.0
@@ -195,15 +239,39 @@ def train_model(
     for epoch in range(1, max_epochs + 1):
         model.train()
         optimizer.zero_grad()
-        logits = model(data.x, data.edge_index, data.edge_attr if edge_dim else None)
-        loss = criterion(logits[train_mask], data.y[train_mask])
-        loss.backward()
+        with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+            if isinstance(model, GATv2GraphTransformer):
+                logits = model(
+                    data.x,
+                    data.edge_index,
+                    data.edge_attr if edge_dim else None,
+                    data.lap_pe,
+                    data.rw_pe,
+                )
+            else:
+                logits = model(data.x, data.edge_index, data.edge_attr if edge_dim else None)
+            loss = criterion(logits[train_mask], data.y[train_mask])
+        scaler_amp.scale(loss).backward()
+        scaler_amp.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
-        optimizer.step()
+        scaler_amp.step(optimizer)
+        scaler_amp.update()
 
         val_metrics = evaluate(model, data, val_mask)
-        scheduler.step(val_metrics["pr_auc"] if not np.isnan(val_metrics["pr_auc"]) else 0.0)
+        scheduler.step()
         criterion.update_history(val_metrics["fn_rate"], val_metrics["fp_rate"])
+        if mlflow_run is not None:
+            import mlflow
+
+            mlflow.log_metrics(
+                {
+                    "loss": float(loss.item()),
+                    "pr_auc": val_metrics["pr_auc"],
+                    "f1": val_metrics["f1"],
+                    "learning_rate": optimizer.param_groups[0]["lr"],
+                },
+                step=epoch,
+            )
 
         improved = val_metrics["pr_auc"] > best_val_pr_auc
         if np.isnan(val_metrics["pr_auc"]):
@@ -279,6 +347,11 @@ def train_model(
     existing = json.loads(metrics_file.read_text()) if metrics_file.exists() else []
     existing.append(metrics_entry)
     metrics_file.write_text(json.dumps(existing, indent=2))
+    if mlflow_run is not None:
+        import mlflow
+
+        mlflow.log_artifact(str(out_dir / "best.pt"))
+        mlflow.end_run()
 
     return summary
 

@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch_geometric.data import Data
 
-from src.models import AdaptiveFocalLoss, GATv2Net
+from src.models import AdaptiveFocalLoss, GATv2GraphTransformer, GATv2Net
 
 
 def _toy_graph(
@@ -51,6 +51,24 @@ def test_without_edge_features() -> None:
     model = GATv2Net(in_channels=9, hidden_channels=32, edge_dim=None)
     logits = model(data.x, data.edge_index)
     assert logits.shape == (data.num_nodes, 2)
+
+
+def test_hybrid_forward_pass_with_structural_encodings() -> None:
+    """The local-global model returns finite node logits with precomputed PE."""
+    data = _toy_graph()
+    lap_pe = torch.randn(data.num_nodes, 4)
+    rw_pe = torch.rand(data.num_nodes, 4)
+    model = GATv2GraphTransformer(
+        in_channels=9,
+        hidden_channels=32,
+        heads=4,
+        edge_dim=2,
+        lap_pe_dim=4,
+        rw_pe_dim=4,
+    )
+    logits = model(data.x, data.edge_index, data.edge_attr, lap_pe, rw_pe)
+    assert logits.shape == (data.num_nodes, 2)
+    assert torch.isfinite(logits).all()
 
 
 def test_invalid_head_scales_raise() -> None:

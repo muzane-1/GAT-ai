@@ -18,6 +18,9 @@ data:
   fetch_retry_backoff_seconds: 1.0
   fetch_timeout_seconds: 20
   velocity_window_seconds: 86400  # 24h transactional velocity window
+  lap_pe_dim: 8
+  rw_pe_dim: 8
+  sampling_batch_size: 2000
 
 model:
   hidden_channels: 64
@@ -28,6 +31,7 @@ model:
   concat_heads: true
   # Edge features (scaled amount, dt) are injected into each GATv2 layer.
   use_edge_features: true
+  architecture: "hybrid"
 
 loss:
   init_alpha: 0.25
@@ -51,6 +55,13 @@ training:
   val_ratio: 0.15
   test_ratio: 0.15
   seed: 42
+  amp: true
+  warmup_epochs: 5
+  scheduler_min_lr: 0.00001
+
+tracking:
+  enabled: false
+  experiment_name: "aml-gnn"
 
 tuning:
   n_trials: 20

@@ -5,6 +5,7 @@ from unittest import mock
 import pandas as pd
 import pytest
 import torch
+from torch_geometric.data import Data
 
 from src.data_pipeline.graph_builder import build_pyg_data
 from src.data_pipeline.ingestion import (
@@ -13,6 +14,11 @@ from src.data_pipeline.ingestion import (
     generate_synthetic_transactions,
     normalize_columns,
 )
+from src.data_pipeline.positional_encoding import (
+    laplacian_positional_encoding,
+    random_walk_structural_encoding,
+)
+from src.data_pipeline.sampling import make_neighbor_loader
 
 
 def test_synthetic_generation_schema() -> None:
@@ -94,3 +100,27 @@ def test_graph_builder_shapes_and_scaling() -> None:
 
     # Feature columns are standardised to zero mean.
     assert abs(data.x.numpy().mean()) < 1e-4
+    assert data.lap_pe.shape == (data.num_nodes, 8)
+    assert data.rw_pe.shape == (data.num_nodes, 8)
+
+
+def test_laplacian_and_random_walk_encodings_are_structural() -> None:
+    """Encodings have stable shapes and RW self-return probabilities."""
+    edge_index = torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]])
+    lap_pe = laplacian_positional_encoding(edge_index, num_nodes=3, num_embeddings=2)
+    rw_pe = random_walk_structural_encoding(edge_index, num_nodes=3, walk_length=2)
+    assert lap_pe.shape == (3, 2)
+    assert rw_pe.shape == (3, 2)
+    assert torch.allclose(rw_pe[:, 0], torch.tensor([0.0, 0.0, 0.0]))
+
+
+def test_neighbor_loader_batch_contract() -> None:
+    """Sampling exposes PyG's node/edge batch contract at the configured size."""
+    data = Data(
+        x=torch.randn(1000, 3),
+        edge_index=torch.tensor([[0, 1], [1, 0]]),
+        y=torch.zeros(1000, dtype=torch.long),
+    )
+    loader = make_neighbor_loader(data, batch_size=1000)
+    assert loader.batch_size == 1000
+    assert loader.data.num_nodes == 1000
