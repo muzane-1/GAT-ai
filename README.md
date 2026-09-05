@@ -13,9 +13,11 @@ src/
   model.py                  # Legacy shim re-exporting GATv2 / GATv2AMLModel
   utils/legacy.py           # Legacy FocalLoss, checkpoint helpers, compute_metrics
   data_pipeline/            # ingestion / auto_fetch / features / graph_builder
+  ingestion/                # optional async Playwright JSON response scraper
+  storage/                  # JSONL cleaning and Parquet/PyG persistence
   eval/                     # Dataset evaluation engine (schema / health / topology / scoring)
   models/                   # GATv2Net and AdaptiveFocalLoss
-  training/                 # train.py (early stop, metrics) and tune.py (Optuna)
+  training/                 # train.py, tune.py, and Modal GPU entry point
   utils/                    # logger, metrics, config loader
 scripts/update_pipeline.py  # Checkpoint registry + metric drift + retrain trigger
 tests/                      # Unit tests for pipeline, models, training
@@ -24,6 +26,16 @@ Dockerfile                  # Slim CPU-ready container
 notebooks/                  # Interactive sandbox + validation notebooks
 train.py                    # Thin shim delegating to src.training.train
 ```
+
+### Browser ingestion and Modal training
+
+`src.ingestion.scraper` provides bounded async Playwright scraping, JSON
+response interception, and storage-state reuse. CAPTCHA challenges are surfaced
+to callers; a caller may provide an approved token or local audio-solver
+callback. `src.storage.pipeline` converts JSONL transaction records to the
+canonical schema and writes Parquet/PyG artifacts. `src.training.modal_train`
+deploys the existing full-graph trainer with `project-data-vol` mounted at
+`/data` and accepts learning rate, batch size, and epoch overrides.
 
 ## Automated Data Pipeline (API Ingestion)
 
