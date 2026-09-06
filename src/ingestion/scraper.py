@@ -102,6 +102,9 @@ class PlaywrightScraper:
         page = await self._context.new_page()
         captured: list[dict[str, Any]] = []
 
+        if headers:
+            await page.set_extra_http_headers(dict(headers))
+
         async def capture(response: Any) -> None:
             content_type = (response.headers.get("content-type") or "").lower()
             if "json" not in content_type and not response.url.lower().endswith(".json"):
@@ -120,10 +123,21 @@ class PlaywrightScraper:
             await page.goto(url, wait_until="networkidle", timeout=self.config.timeout_ms)
             if wait_for:
                 await page.wait_for_selector(wait_for)
+            # CAPTCHA handling must never block the orchestration loop: without
+            # a token/solver the challenge is logged and scraping continues
+            # with whatever JSON was captured before the challenge appeared.
             challenge = await self.detect_captcha(page)
             if challenge is not None:
-                await self.handle_captcha(page, challenge)
+                try:
+                    await self.handle_captcha(page, challenge)
+                except RuntimeError as exc:
+                    logger.warning(
+                        "captcha_unsolved_url_continued", extra={"url": url, "error": str(exc)}
+                    )
             await asyncio.sleep(0)
+            return captured
+        except Exception as exc:  # noqa: BLE001 - a single bad page must not crash callers
+            logger.warning("scrape_json_failed", extra={"url": url, "error": str(exc)})
             return captured
         finally:
             await page.close()
@@ -172,16 +186,28 @@ async def scrape_urls(
     config: ScraperConfig | None = None,
     audio_solver: AudioSolver | None = None,
 ) -> list[dict[str, Any]]:
-    """Scrape URLs with bounded concurrency."""
-    semaphore = asyncio.Semaphore((config or ScraperConfig()).max_concurrency)
-    async with PlaywrightScraper(config or ScraperConfig(), audio_solver) as scraper:
+    """Scrape URLs with bounded concurrency.
+
+    Failures are isolated per URL: a broken page logs a warning and yields no
+    records instead of aborting the whole batch (crash-resilient guarantee).
+    """
+    effective_config = config or ScraperConfig()
+    semaphore = asyncio.Semaphore(effective_config.max_concurrency)
+    async with PlaywrightScraper(effective_config, audio_solver) as scraper:
 
         async def scrape(url: str) -> list[dict[str, Any]]:
             async with semaphore:
                 return await scraper.scrape_json(url)
 
-        results = await asyncio.gather(*(scrape(url) for url in urls))
-    return [item for batch in results for item in batch]
+        results = await asyncio.gather(*(scrape(url) for url in urls), return_exceptions=True)
+
+    records: list[dict[str, Any]] = []
+    for url, result in zip(urls, results, strict=False):
+        if isinstance(result, BaseException):
+            logger.warning("scrape_urls_item_failed", extra={"url": url, "error": str(result)})
+            continue
+        records.extend(result)
+    return records
 
 
 def write_jsonl(records: list[Mapping[str, Any]], path: str | Path) -> Path:

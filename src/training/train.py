@@ -49,7 +49,8 @@ def make_masks(y: torch.Tensor, val_ratio: float, test_ratio: float, seed: int) 
         indices, labels, test_size=train_val_ratio, random_state=seed, stratify=stratify
     )
     relative_test = test_ratio / train_val_ratio
-    second_stratify = tmp_labels if len(np.unique(tmp_labels)) == 2 else None
+    tmp_unique, tmp_counts = np.unique(tmp_labels, return_counts=True)
+    second_stratify = tmp_labels if (len(tmp_unique) == 2 and tmp_counts.min() >= 2) else None
     val_idx, test_idx = train_test_split(
         tmp_idx, test_size=relative_test, random_state=seed, stratify=second_stratify
     )
@@ -110,6 +111,8 @@ def train_model(
     epochs: int | None = None,
     run_dir: str | Path | None = None,
     quiet: bool = False,
+    data: Any = None,
+    scaler: Any = None,
 ) -> dict[str, Any]:
     """Full training run used by the CLI, tuner and update pipeline alike.
 
@@ -118,6 +121,10 @@ def train_model(
         epochs: Optional epoch override (tuner passes a smaller value).
         run_dir: Optional output-directory override.
         quiet: When ``True``, epoch-by-epoch logging is suppressed.
+        data: Optional prebuilt PyG ``Data`` object (e.g. loaded from the
+            sanitized ``/data/transactions.pt`` artifact by the Modal shim).
+            When given, the fetch/build stages are skipped entirely.
+        scaler: Optional scaler paired with ``data`` (stored in checkpoints).
 
     Returns:
         Summary mapping with ``best_val_metrics``, ``test_metrics``,
@@ -141,18 +148,19 @@ def train_model(
         "fraud_ratio": data_cfg.get("fallback_fraud_ratio", 0.02),
         "seed": data_cfg.get("fallback_seed", 42),
     }
-    df = fetch_transactions(
-        data_cfg["raw_source"],
-        n_retry=data_cfg.get("fetch_retry_attempts", 3),
-        backoff_seconds=data_cfg.get("fetch_retry_backoff_seconds", 1.0),
-        timeout_seconds=data_cfg.get("fetch_timeout_seconds", 20.0),
-        fallback_generate=data_cfg.get("fallback_generate", True),
-        fallback_kwargs=fallback_kwargs,
-    )
+    if data is None:
+        df = fetch_transactions(
+            data_cfg["raw_source"],
+            n_retry=data_cfg.get("fetch_retry_attempts", 3),
+            backoff_seconds=data_cfg.get("fetch_retry_backoff_seconds", 1.0),
+            timeout_seconds=data_cfg.get("fetch_timeout_seconds", 20.0),
+            fallback_generate=data_cfg.get("fallback_generate", True),
+            fallback_kwargs=fallback_kwargs,
+        )
 
-    data, scaler = build_pyg_data(
-        df, velocity_window_seconds=float(data_cfg.get("velocity_window_seconds", 86400))
-    )
+        data, scaler = build_pyg_data(
+            df, velocity_window_seconds=float(data_cfg.get("velocity_window_seconds", 86400))
+        )
     train_mask, val_mask, test_mask = make_masks(
         data.y,
         val_ratio=train_cfg["val_ratio"],
@@ -362,7 +370,26 @@ def main() -> None:
     parser.add_argument("--config", default="config/config.yaml", help="YAML config path")
     parser.add_argument("--epochs", type=int, default=None, help="Epoch override")
     parser.add_argument("--output", default=None, help="Checkpoint directory override")
+    parser.add_argument(
+        "--modal",
+        action="store_true",
+        help="Delegate training to the Modal.ai GPU shim (src.training.modal_train)",
+    )
+    parser.add_argument(
+        "--learning-rate", type=float, default=0.005, help="Learning rate (Modal runs)"
+    )
     args = parser.parse_args()
+
+    if args.modal:
+        # Delegate directly to the Modal GPU training shim.
+        from src.training.modal_train import run_remote
+
+        summary = run_remote(
+            learning_rate=args.learning_rate,
+            epochs=args.epochs if args.epochs is not None else 10,
+        )
+        logger.info("modal summary: %s", json.dumps(summary, indent=2))
+        return
 
     config = load_config(args.config)
     summary = train_model(config, epochs=args.epochs, run_dir=args.output)

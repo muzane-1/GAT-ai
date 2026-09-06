@@ -26,6 +26,7 @@ callers (training, CI, notebooks) never see a hard crash.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import os
 import re
@@ -35,7 +36,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import numpy as np
 import pandas as pd
@@ -376,11 +377,109 @@ def search_web(query: str, *, limit: int = 8, timeout: float = 15.0) -> list[Dat
     return out
 
 
+# ---------------------------------------------------------------------------
+# Playwright (browser) web fallback — delegates to src.ingestion.scraper
+# ---------------------------------------------------------------------------
+
+#: Keyless JSON endpoints revisited through a real browser when the plain
+#: ``requests``-based search above is blocked (bot walls, TLS fingerprints...).
+_BROWSER_SEARCH_ENDPOINTS: tuple[str, ...] = (
+    "https://api.github.com/search/repositories?q={query}&per_page={limit}",
+    "https://huggingface.co/api/datasets?search={query}&limit={limit}",
+)
+
+
+def candidates_from_json_records(
+    records: Iterable[Any],
+    *,
+    provider: str = "web-browser",
+    limit: int = 8,
+) -> list[DatasetCandidate]:
+    """Convert intercepted JSON payloads into :class:`DatasetCandidate` rows.
+
+    Accepts the heterogeneous dictionaries captured by
+    :func:`src.ingestion.scraper.scrape_urls` (bare items or ``{"items": [...]}``
+    search payloads) and never raises on malformed entries.
+    """
+    out: list[DatasetCandidate] = []
+    seen: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        items = record.get("items") if isinstance(record.get("items"), list) else [record]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("html_url") or item.get("url") or ""
+            title = item.get("name") or item.get("title") or item.get("id") or ""
+            if not url or not title:
+                continue
+            key = f"{provider}:{url}"
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                DatasetCandidate(
+                    id=key,
+                    provider=provider,
+                    title=str(title),
+                    url=str(url),
+                    description=str(item.get("description") or ""),
+                    metadata={"columns": list(item.get("columns") or [])},
+                )
+            )
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def search_web_browser(
+    query: str, *, limit: int = 8, timeout_ms: int = 30_000
+) -> list[DatasetCandidate]:
+    """Dynamic browser scraping fallback via the Playwright scraper.
+
+    Launches a headless Chromium session through
+    :func:`src.ingestion.scraper.scrape_urls`, captures the keyless JSON search
+    responses and converts them into candidates. Any failure (missing
+    Playwright, browser crash, CAPTCHA without solver, malformed payloads)
+    degrades to an empty list — the orchestration loop never crashes.
+    """
+    try:
+        from src.ingestion.scraper import ScraperConfig, scrape_urls
+    except Exception as exc:  # noqa: BLE001 - optional dependency
+        logger.warning("browser_scrape_unavailable", extra={"error": str(exc)})
+        return []
+
+    endpoints = [
+        endpoint.format(query=quote(query), limit=limit) for endpoint in _BROWSER_SEARCH_ENDPOINTS
+    ]
+    try:
+        records = asyncio.run(scrape_urls(endpoints, config=ScraperConfig(timeout_ms=timeout_ms)))
+    except Exception as exc:  # noqa: BLE001 - crash-resilient guarantee
+        logger.warning("browser_scrape_failed", extra={"query": query, "error": str(exc)})
+        return []
+    candidates = candidates_from_json_records(records, limit=limit)
+    if candidates:
+        logger.info("browser_scrape_candidates", extra={"query": query, "count": len(candidates)})
+    return candidates
+
+
+def search_web_resilient(
+    query: str, *, limit: int = 8, timeout: float = 15.0
+) -> list[DatasetCandidate]:
+    """Requests-based web search with an automatic Playwright fallback."""
+    results = search_web(query, limit=limit, timeout=timeout)
+    if results:
+        return results
+    logger.info("web_search_falling_back_to_browser", extra={"query": query})
+    return search_web_browser(query, limit=limit)
+
+
 _PLUGINS: tuple[tuple[str, Callable[..., list[DatasetCandidate]]], ...] = (
     ("huggingface", search_huggingface),
     ("github", search_github),
     ("kaggle", search_kaggle),
-    ("web", search_web),
+    ("web", search_web_resilient),
 )
 _PROVIDERS.update(_PLUGINS)
 # ---------------------------------------------------------------------------
@@ -1010,6 +1109,69 @@ def handoff(
         "feature_stats": feature_stats,
         "graph_info": graph_info,
     }
+
+
+def handoff_to_storage(
+    datasets: Iterable[VerifiedDataset | pd.DataFrame],
+    *,
+    artifact_root: str | Path | None = None,
+    log_amount: bool = True,
+) -> list[dict[str, Any]]:
+    """Persist verified discovery results into durable Parquet/PyG artifacts.
+
+    Connects candidate datasets retrieved by the agentic discovery stages
+    directly into ``src.storage.pipeline``. Each item is strictly gated before
+    persistence:
+
+    * :class:`VerifiedDataset` items must have cleared
+      :func:`assess_reliability` (``verified=True``, i.e. an explicit
+      supervisory label **and** edge connections present);
+    * raw frames must satisfy the canonical schema gate
+      (``tx_id, src, dst, amount, timestamp, is_laundering``).
+
+    Amounts are log-scale normalized and duplicates removed before writing the
+    Parquet + PyG ``.pt`` artifacts under the Modal Volume mount.
+
+    Args:
+        datasets: Verified discovery results and/or raw candidate frames.
+        artifact_root: Explicit artifact root override (defaults to the Modal
+            ``project-data-vol`` mount at ``/data``).
+        log_amount: Apply ``log1p`` normalization to ``amount`` (default True).
+
+    Returns:
+        One status mapping per input: ``{"id", "status": "persisted", ...}``
+        or ``{"id", "status": "rejected", "reason"}``. Never raises.
+    """
+    from src.storage.pipeline import persist_transactions
+
+    results: list[dict[str, Any]] = []
+    for index, item in enumerate(datasets):
+        dataset_id = f"inline:{index}"
+        try:
+            if isinstance(item, pd.DataFrame):
+                frame = item
+            else:
+                dataset_id = item.candidate.id
+                if not item.assessment.verified:
+                    raise ValueError("dataset failed the strict reliability gate (score <100 path)")
+                frame = item.raw_df
+                if frame is None:
+                    raise ValueError("verified dataset carries no raw table")
+            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(dataset_id)).strip("-")
+            safe_name = safe_name or f"dataset-{index}"
+            stats = persist_transactions(
+                frame,
+                f"datasets/{safe_name}",
+                root=artifact_root,
+                log_amount=log_amount,
+            )
+            results.append({"id": str(dataset_id), "status": "persisted", **stats})
+        except Exception as exc:  # noqa: BLE001 - one bad dataset must not abort the batch
+            logger.warning(
+                "storage_handoff_rejected", extra={"dataset": dataset_id, "error": str(exc)}
+            )
+            results.append({"id": str(dataset_id), "status": "rejected", "reason": str(exc)})
+    return results
 
 
 def list_candidate_datasets(
