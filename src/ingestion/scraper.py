@@ -142,6 +142,62 @@ class PlaywrightScraper:
         finally:
             await page.close()
 
+    async def scrape_page(
+        self,
+        url: str,
+        *,
+        wait_for: str | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Capture response bodies from a JavaScript-rendered page.
+
+        The returned bodies are intentionally raw bytes so callers can pass
+        CSV, JSON, or Parquet responses through their own ingestion pipeline.
+        CAPTCHA handling and storage-state reuse follow :meth:`scrape_json`.
+        """
+        if self._context is None:
+            raise RuntimeError("PlaywrightScraper must be used as an async context manager")
+        page = await self._context.new_page()
+        captured: list[dict[str, Any]] = []
+
+        if headers:
+            await page.set_extra_http_headers(dict(headers))
+
+        async def capture(response: Any) -> None:
+            content_type = (response.headers.get("content-type") or "").lower()
+            try:
+                body = await response.body()
+            except Exception as exc:  # noqa: BLE001 - an individual response is optional
+                logger.warning(
+                    "scrape_page_response_failed",
+                    extra={"url": response.url, "error": str(exc)},
+                )
+                return
+            captured.append(
+                {"url": response.url, "content_type": content_type, "body": body}
+            )
+
+        page.on("response", capture)
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=self.config.timeout_ms)
+            if wait_for:
+                await page.wait_for_selector(wait_for)
+            challenge = await self.detect_captcha(page)
+            if challenge is not None:
+                try:
+                    await self.handle_captcha(page, challenge)
+                except RuntimeError as exc:
+                    logger.warning(
+                        "captcha_unsolved_url_continued", extra={"url": url, "error": str(exc)}
+                    )
+            await asyncio.sleep(0)
+            return captured
+        except Exception as exc:  # noqa: BLE001 - a single bad page must not crash callers
+            logger.warning("scrape_page_failed", extra={"url": url, "error": str(exc)})
+            return captured
+        finally:
+            await page.close()
+
     async def detect_captcha(self, page: Any) -> CaptchaChallenge | None:
         """Detect common CAPTCHA markers and extract an audio challenge URL."""
         content = (await page.content()).lower()

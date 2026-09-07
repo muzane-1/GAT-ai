@@ -32,7 +32,7 @@ import os
 import re
 import shutil
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -48,6 +48,7 @@ from src.data_pipeline.ingestion import (
     generate_synthetic_transactions,
 )
 from src.eval.scoring import evaluate_candidate_dataset
+from src.ingestion.scraper import PlaywrightScraper, ScraperConfig
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -887,6 +888,67 @@ def download_dataset(
     raise RuntimeError(f"Unsupported download scheme for {candidate.id}: {url!r}")
 
 
+def _browser_download_dataset(
+    candidate: DatasetCandidate,
+    download_dir: Path | str,
+    *,
+    timeout: float,
+    storage_state_path: str | Path | None = None,
+    captcha_token: str | None = None,
+    audio_solver: Callable[[str], str | None | Awaitable[str | None]] | None = None,
+) -> Path | None:
+    """Capture a failed HTTP dataset response through Playwright."""
+    url = candidate.download_url
+    if not url or not url.startswith(("http://", "https://")):
+        return None
+
+    config = ScraperConfig(
+        timeout_ms=max(1, int(timeout * 1000)),
+        storage_state_path=storage_state_path or os.environ.get("AML_STORAGE_STATE_PATH"),
+        captcha_token=captcha_token or os.environ.get("AML_CAPTCHA_TOKEN"),
+    )
+
+    async def capture() -> list[dict[str, Any]]:
+        async with PlaywrightScraper(config, audio_solver) as scraper:
+            return await scraper.scrape_page(url)
+
+    responses = asyncio.run(capture())
+    if not responses:
+        return None
+
+    url_suffix = Path(unquote(url.split("?", 1)[0])).suffix.lower()
+    table_types = (
+        "text/csv",
+        "application/json",
+        "application/octet-stream",
+        "application/parquet",
+    )
+    preferred = [
+        item
+        for item in responses
+        if item.get("url") == url or item.get("content_type", "").startswith(table_types)
+    ]
+    response = preferred[0] if preferred else responses[-1]
+    body = response.get("body")
+    if not isinstance(body, bytes) or not body:
+        return None
+
+    content_type = str(response.get("content_type", "")).lower()
+    suffix = url_suffix
+    if not suffix:
+        suffix = (
+            ".json"
+            if "json" in content_type
+            else ".csv"
+            if "csv" in content_type or "text" in content_type
+            else ".parquet"
+        )
+    destination = Path(download_dir) / (_safe_filename(Path(url).name) + suffix)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(body)
+    return destination
+
+
 def _read_table(path: Path) -> pd.DataFrame:
     """Read a downloaded file into a DataFrame (CSV/JSON/Parquet)."""
     suffix = path.suffix.lower()
@@ -904,6 +966,9 @@ def verify_candidates(
     top_k: int = 3,
     timeout: float = 30.0,
     strict: bool = True,
+    storage_state_path: str | Path | None = None,
+    captcha_token: str | None = None,
+    audio_solver: Callable[[str], str | None | Awaitable[str | None]] | None = None,
 ) -> list[VerifiedDataset]:
     """Download top-K candidates and re-score them on the real raw table.
 
@@ -925,14 +990,46 @@ def verify_candidates(
             local = download_dataset(candidate, download_dir, timeout=timeout)
         except Exception as exc:  # noqa: BLE001 - a failed download is not fatal
             logger.warning("download_failed", extra={"id": candidate.id, "error": str(exc)})
-            continue
+            try:
+                local = _browser_download_dataset(
+                    candidate,
+                    download_dir,
+                    timeout=timeout,
+                    storage_state_path=storage_state_path,
+                    captcha_token=captcha_token,
+                    audio_solver=audio_solver,
+                )
+            except Exception as browser_exc:  # noqa: BLE001 - candidate isolation is intentional
+                logger.warning(
+                    "browser_download_failed",
+                    extra={"id": candidate.id, "error": str(browser_exc)},
+                )
+                continue
         if local is None or not local.exists():
             continue
         try:
             raw = _read_table(local)
         except Exception as exc:  # noqa: BLE001 - unreadable bytes are skipped
             logger.warning("read_failed", extra={"path": str(local), "error": str(exc)})
-            continue
+            try:
+                local = _browser_download_dataset(
+                    candidate,
+                    download_dir,
+                    timeout=timeout,
+                    storage_state_path=storage_state_path,
+                    captcha_token=captcha_token,
+                    audio_solver=audio_solver,
+                )
+                if local is None or not local.exists():
+                    continue
+                raw = _read_table(local)
+            except Exception as browser_exc:  # noqa: BLE001 - candidate isolation is intentional
+                logger.warning(
+                    "browser_read_failed",
+                    extra={"id": candidate.id, "error": str(browser_exc)},
+                )
+                continue
+        raw = sanitize_transactions(raw)
         assessment = assess_reliability(candidate, df=raw)
         if strict and not assessment.verified:
             continue
@@ -964,6 +1061,9 @@ def discover_and_verify(
     top_k: int = 3,
     timeout: float = 30.0,
     strict: bool = True,
+    storage_state_path: str | Path | None = None,
+    captcha_token: str | None = None,
+    audio_solver: Callable[[str], str | None] | None = None,
 ) -> list[VerifiedDataset]:
     """One-shot agentic pipeline: generate queries -> discover -> verify.
 
@@ -983,7 +1083,16 @@ def discover_and_verify(
     if not candidates:
         logger.info("no_candidates_discovered")
         return []
-    return verify_candidates(candidates, download_dir, top_k=top_k, timeout=timeout, strict=strict)
+    return verify_candidates(
+        candidates,
+        download_dir,
+        top_k=top_k,
+        timeout=timeout,
+        strict=strict,
+        storage_state_path=storage_state_path,
+        captcha_token=captcha_token,
+        audio_solver=audio_solver,
+    )
 
 
 def verified_summary(verified: Iterable[VerifiedDataset]) -> list[dict[str, Any]]:
