@@ -80,3 +80,13 @@ monitoring:
   drift_metric: "pr_auc"
   drift_threshold: 0.05
   absolute_floor: 0.60  # retrain if primary metric falls below this value
+  # Substructure-Aware Verification: verify predictions against local AML
+  # motifs (directed cycles, smurfing fans, dense/k-core subgraphs) and fire
+  # an independent retrain trigger on structural misclassification.
+  substructure_verification: true
+  structural_misclassification_threshold: 0.15  # contradicted-prediction share
+  verified_rate_floor: 0.50                     # min share of supported alerts
+  # Optional overrides forwarded to SubstructureVerifierConfig (key = field).
+  verifier:
+    k_hop: 2
+    top_k: 128

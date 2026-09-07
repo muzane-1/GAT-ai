@@ -101,17 +101,151 @@ def register_checkpoint(registry_path: Path, checkpoint_path: str, metrics: dict
     registry: list[dict[str, Any]] = []
     if registry_path.exists():
         registry = json.loads(registry_path.read_text())
-    registry.append(
-        {
-            "timestamp": time.time(),
-            "checkpoint": checkpoint_path,
-            "test_metrics": metrics.get("test_metrics", {}),
-            "val_metrics": metrics.get("best_val_metrics", {}),
-        }
-    )
+    entry: dict[str, Any] = {
+        "timestamp": time.time(),
+        "checkpoint": checkpoint_path,
+        "test_metrics": metrics.get("test_metrics", {}),
+        "val_metrics": metrics.get("best_val_metrics", {}),
+    }
+    if metrics.get("verification") is not None:
+        entry["verification"] = metrics["verification"]
+    registry.append(entry)
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     registry_path.write_text(json.dumps(registry, indent=2))
     logger.info("Registered checkpoint %s", checkpoint_path)
+
+
+# ---------------------------------------------------------------------------
+# Substructure-Aware Verification — structural retrain trigger
+# ---------------------------------------------------------------------------
+
+
+def _load_verification_graph(config: dict[str, Any]) -> Any:
+    """Load the persisted PyG artifact, falling back to ``fetch_to_pyg``."""
+    from src.data_pipeline import fetch_to_pyg
+    from src.storage.pipeline import get_data_mount, load_pyg_dataset
+
+    artifact = get_data_mount() / "transactions.pt"
+    if artifact.exists():
+        data, _ = load_pyg_dataset(artifact)
+        logger.info("Verification graph loaded from %s", artifact)
+        return data
+    data, _ = fetch_to_pyg()  # crash-resilient: synthetic fallback built in
+    return data
+
+
+def _predict_probabilities(checkpoint: dict[str, Any], data: Any) -> Any:
+    """Rebuild the trained model from a checkpoint and score every node."""
+    import torch
+
+    from src.models import GATv2GraphTransformer, GATv2Net
+
+    model_cfg = checkpoint.get("config", {}).get("model", {})
+    edge_dim = int(data.edge_attr.shape[1]) if model_cfg.get("use_edge_features", True) else None
+    if model_cfg.get("architecture", "gatv2") == "hybrid":
+        model: Any = GATv2GraphTransformer(
+            in_channels=data.num_features,
+            hidden_channels=model_cfg["hidden_channels"],
+            num_layers=model_cfg["num_layers"],
+            heads=model_cfg["heads"],
+            dropout=model_cfg["dropout"],
+            edge_dim=edge_dim,
+            lap_pe_dim=data.lap_pe.size(1),
+            rw_pe_dim=data.rw_pe.size(1),
+        )
+    else:
+        model = GATv2Net(
+            in_channels=data.num_features,
+            hidden_channels=model_cfg["hidden_channels"],
+            num_layers=model_cfg["num_layers"],
+            heads=model_cfg["heads"],
+            dropout=model_cfg["dropout"],
+            concat_heads=model_cfg.get("concat_heads", True),
+            edge_dim=edge_dim,
+        )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    with torch.no_grad():
+        if isinstance(model, GATv2GraphTransformer):
+            return model.predict_prob(
+                data.x, data.edge_index, data.edge_attr, data.lap_pe, data.rw_pe
+            )
+        return model.predict_prob(data.x, data.edge_index, data.edge_attr)
+
+
+def run_structural_verification(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Self-verify the deployed model's predictions against graph motifs.
+
+    Loads the persisted graph, scores nodes with the best checkpoint and asks
+    the substructure verifier whether predictions align with laundering motifs
+    (directed cycles, smurfing fans, dense/k-core subgraphs). Fully
+    crash-resilient: any failure yields ``None`` and never aborts the update
+    pipeline. Decoupled from ``src.training.train`` — only the checkpoint
+    artifact is consumed.
+
+    Returns:
+        ``{"decision": ..., "summary": ..., "feedback": [...]}`` or ``None``
+        when verification is disabled, unavailable, or no checkpoint exists.
+    """
+    monitoring = config.get("monitoring", {})
+    if not monitoring.get("substructure_verification", True):
+        return None
+    try:
+        import torch
+
+        from src.eval import (
+            SubstructureVerifierConfig,
+            detect_structural_trigger,
+            summarise_verification,
+            verify_predictions,
+        )
+
+        data = _load_verification_graph(config)
+        checkpoint_path = Path(config["paths"]["best_checkpoint"])
+        if not checkpoint_path.exists():
+            logger.info("Substructure verification skipped: no checkpoint at %s", checkpoint_path)
+            return None
+        checkpoint = torch.load(  # nosec B614 - locally produced artifact
+            checkpoint_path, map_location="cpu", weights_only=False
+        )
+        probs = _predict_probabilities(checkpoint, data)
+
+        overrides = monitoring.get("verifier") or {}
+        verifier_config = (
+            SubstructureVerifierConfig(**overrides) if isinstance(overrides, dict) else None
+        )
+        report = verify_predictions(data, probs, y=data.y, config=verifier_config)
+        decision = detect_structural_trigger(report, config=verifier_config)
+        logger.info("structural verification: %s", decision["reason"])
+
+        return {
+            "decision": decision,
+            "summary": summarise_verification(report),
+            "feedback": list(report.get("structural_feedback", []))[:16],
+        }
+    except Exception as exc:  # noqa: BLE001 - verification must never crash the loop
+        logger.warning("substructure_verification_failed", extra={"error": str(exc)})
+        return None
+
+
+def combine_triggers(
+    drift_decision: dict[str, Any],
+    structural_decision: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge the metric-drift and structural-verification decisions.
+
+    Either trigger fires retraining; the combined ``reason`` records both.
+    """
+    combined = dict(drift_decision)
+    structural_fired = bool(structural_decision and structural_decision["decision"]["triggered"])
+    combined["structural_trigger"] = structural_fired
+    if structural_fired and not drift_decision["drifted"]:
+        combined["drifted"] = True
+        combined["reason"] = (
+            f"{drift_decision['reason']} | structural: "
+            f"{structural_decision['decision']['reason']}"  # type: ignore[index]
+        )
+    return combined
 
 
 def run(config_path: str = "config/config.yaml") -> dict[str, Any]:
@@ -137,11 +271,24 @@ def run(config_path: str = "config/config.yaml") -> dict[str, Any]:
     )
     logger.info("drift decision: %s", decision["reason"])
 
+    # Substructure-Aware Verification: an independent structural trigger.
+    verification = run_structural_verification(config)
+    decision = combine_triggers(decision, verification)
+    decision["verification"] = verification["summary"] if verification else None
+    logger.info("combined decision: %s", decision["reason"])
+
     if decision["drifted"]:
         logger.info("Triggering retraining")
         summary = train_model(config)
         registry_path = Path(paths["checkpoints_dir"]) / REGISTRY_FILE
-        register_checkpoint(registry_path, summary["checkpoint"], summary)
+        register_checkpoint(
+            registry_path,
+            summary["checkpoint"],
+            {
+                **summary,
+                "verification": verification["summary"] if verification else None,
+            },
+        )
         decision["retrained"] = True
         decision["checkpoint"] = summary["checkpoint"]
     else:
