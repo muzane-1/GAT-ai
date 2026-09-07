@@ -3,7 +3,7 @@
 import pandas as pd
 import pytest
 
-from src.data_pipeline.features import FEATURE_COLUMNS, compute_node_features
+from src.pipeline.transform.features import FEATURE_COLUMNS, compute_node_features
 
 
 @pytest.fixture()

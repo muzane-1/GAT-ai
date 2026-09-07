@@ -173,9 +173,7 @@ class PlaywrightScraper:
                     extra={"url": response.url, "error": str(exc)},
                 )
                 return
-            captured.append(
-                {"url": response.url, "content_type": content_type, "body": body}
-            )
+            captured.append({"url": response.url, "content_type": content_type, "body": body})
 
         page.on("response", capture)
         try:

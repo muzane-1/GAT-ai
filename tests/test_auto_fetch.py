@@ -6,17 +6,17 @@ from unittest import mock
 import pandas as pd
 import pytest
 
-from src.data_pipeline.auto_fetch import (
+from src.pipeline.discovery.auto_fetch import (
     auto_fetch,
     fetch_to_pyg,
     sanitize_transactions,
     validate_transactions,
 )
-from src.data_pipeline.ingestion import CANONICAL_COLUMNS
+from src.pipeline.discovery.ingestion import CANONICAL_COLUMNS
 
 # NB: the package re-exports the `auto_fetch` function under the same name,
 # shadowing the submodule for attribute access, so import the module explicitly.
-AUTO_FETCH_MODULE = import_module("src.data_pipeline.auto_fetch")
+AUTO_FETCH_MODULE = import_module("src.pipeline.discovery.auto_fetch")
 
 
 def _install_fake_hf(monkeypatch: pytest.MonkeyPatch, api: mock.Mock) -> None:
@@ -74,7 +74,7 @@ def test_auto_fetch_synthetic_fallback_and_pyg() -> None:
 
 
 def test_evaluate_candidate_dataset() -> None:
-    from src.data_pipeline.auto_fetch import evaluate_candidate_dataset
+    from src.pipeline.discovery.auto_fetch import evaluate_candidate_dataset
 
     df = pd.DataFrame(
         {
@@ -95,7 +95,7 @@ def test_evaluate_candidate_dataset() -> None:
 
 
 def test_list_candidate_datasets() -> None:
-    from src.data_pipeline.auto_fetch import list_candidate_datasets
+    from src.pipeline.discovery.auto_fetch import list_candidate_datasets
 
     # Test with default keywords and tags
     datasets = list_candidate_datasets()
@@ -108,7 +108,7 @@ def test_list_candidate_datasets() -> None:
 
 def test_list_candidate_datasets_success(monkeypatch: pytest.MonkeyPatch) -> None:
     """Happy path: the HF API returns rows that are mapped to dataset ids."""
-    from src.data_pipeline.auto_fetch import list_candidate_datasets
+    from src.pipeline.discovery.auto_fetch import list_candidate_datasets
 
     api = mock.Mock()
     api.list_datasets.return_value = [mock.Mock(id="owner/ds-a"), mock.Mock(id="owner/ds-b")]
@@ -121,7 +121,7 @@ def test_list_candidate_datasets_success(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_list_candidate_datasets_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default keywords and tags are passed through to the HF API."""
-    from src.data_pipeline.auto_fetch import list_candidate_datasets
+    from src.pipeline.discovery.auto_fetch import list_candidate_datasets
 
     api = mock.Mock()
     api.list_datasets.return_value = []
@@ -135,7 +135,7 @@ def test_list_candidate_datasets_defaults(monkeypatch: pytest.MonkeyPatch) -> No
 
 def test_evaluate_candidate_dataset_aliases() -> None:
     """Aliased columns are resolved for scoring (value / timestamp_seconds / label)."""
-    from src.data_pipeline.auto_fetch import evaluate_candidate_dataset
+    from src.pipeline.discovery.auto_fetch import evaluate_candidate_dataset
 
     df = pd.DataFrame(
         {
@@ -154,7 +154,7 @@ def test_evaluate_candidate_dataset_aliases() -> None:
 
 def test_evaluate_timestamp_parse_failure() -> None:
     """Unparseable timestamps land in the scoring except-branch."""
-    from src.data_pipeline.auto_fetch import evaluate_candidate_dataset
+    from src.pipeline.discovery.auto_fetch import evaluate_candidate_dataset
 
     df = pd.DataFrame(
         {
@@ -172,7 +172,7 @@ def test_evaluate_timestamp_parse_failure() -> None:
 
 def test_evaluate_aml_balance_saturated() -> None:
     """An all-positive class ratio saturates the balance penalty branch."""
-    from src.data_pipeline.auto_fetch import evaluate_candidate_dataset
+    from src.pipeline.discovery.auto_fetch import evaluate_candidate_dataset
 
     df = pd.DataFrame(
         {
@@ -353,7 +353,7 @@ def test_list_candidate_datasets_merges_extra_sources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """repo_ids / local_paths / synthetic_ids are merged onto HF results."""
-    from src.data_pipeline.auto_fetch import list_candidate_datasets
+    from src.pipeline.discovery.auto_fetch import list_candidate_datasets
 
     api = mock.Mock()
     api.list_datasets.return_value = [mock.Mock(id="owner/ds-a")]
@@ -376,7 +376,7 @@ def test_list_candidate_datasets_api_failure_still_returns_extras(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An HF API failure degrades to the configured explicit sources."""
-    from src.data_pipeline.auto_fetch import list_candidate_datasets
+    from src.pipeline.discovery.auto_fetch import list_candidate_datasets
 
     api = mock.Mock()
     api.list_datasets.side_effect = RuntimeError("no network")

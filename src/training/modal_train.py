@@ -43,7 +43,7 @@ def load_training_inputs(
         return "parquet", load_parquet(parquet_path)
     raise FileNotFoundError(
         f"No training artifacts found at {pyg_path!r} or {parquet_path!r}; "
-        "run src.data_pipeline.auto_fetch.handoff_to_storage first"
+        "run src.pipeline.discovery.auto_fetch.handoff_to_storage first"
     )
 
 

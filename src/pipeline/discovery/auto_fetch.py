@@ -42,13 +42,13 @@ import numpy as np
 import pandas as pd
 import requests
 
-from src.data_pipeline.ingestion import (
+from src.pipeline.discovery.ingestion import (
     CANONICAL_COLUMNS,
     fetch_transactions,
     generate_synthetic_transactions,
 )
-from src.eval.scoring import evaluate_candidate_dataset
-from src.ingestion.scraper import PlaywrightScraper, ScraperConfig
+from src.pipeline.discovery.scraper import PlaywrightScraper, ScraperConfig
+from src.pipeline.validation.scoring import evaluate_candidate_dataset
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -379,7 +379,7 @@ def search_web(query: str, *, limit: int = 8, timeout: float = 15.0) -> list[Dat
 
 
 # ---------------------------------------------------------------------------
-# Playwright (browser) web fallback — delegates to src.ingestion.scraper
+# Playwright (browser) web fallback — delegates to src.pipeline.discovery.scraper
 # ---------------------------------------------------------------------------
 
 #: Keyless JSON endpoints revisited through a real browser when the plain
@@ -399,7 +399,7 @@ def candidates_from_json_records(
     """Convert intercepted JSON payloads into :class:`DatasetCandidate` rows.
 
     Accepts the heterogeneous dictionaries captured by
-    :func:`src.ingestion.scraper.scrape_urls` (bare items or ``{"items": [...]}``
+    :func:`src.pipeline.discovery.scraper.scrape_urls` (bare items or ``{"items": [...]}``
     search payloads) and never raises on malformed entries.
     """
     out: list[DatasetCandidate] = []
@@ -440,13 +440,13 @@ def search_web_browser(
     """Dynamic browser scraping fallback via the Playwright scraper.
 
     Launches a headless Chromium session through
-    :func:`src.ingestion.scraper.scrape_urls`, captures the keyless JSON search
+    :func:`src.pipeline.discovery.scraper.scrape_urls`, captures the keyless JSON search
     responses and converts them into candidates. Any failure (missing
     Playwright, browser crash, CAPTCHA without solver, malformed payloads)
     degrades to an empty list — the orchestration loop never crashes.
     """
     try:
-        from src.ingestion.scraper import ScraperConfig, scrape_urls
+        from src.pipeline.discovery.scraper import ScraperConfig, scrape_urls
     except Exception as exc:  # noqa: BLE001 - optional dependency
         logger.warning("browser_scrape_unavailable", extra={"error": str(exc)})
         return []
@@ -732,7 +732,7 @@ def assess_reliability(
 ) -> DatasetAssessment:
     """Score a candidate 0-100 and apply the strict label + edge gates.
 
-    When a real table is available (post-download) the repo's ``src.eval``
+    When a real table is available (post-download) the repo's ``src.pipeline.validation``
     engine measures schema fit / data health / topology and the gates are
     checked on actual columns. Without a table, the same contract is evaluated
     against the candidate's metadata heuristics (``columns``/``fields``).
@@ -1129,7 +1129,7 @@ def handoff_to_ingestion(
     *,
     output: Path | str | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Normalise raw matrices via :mod:`src.data_pipeline.ingestion`.
+    """Normalise raw matrices via :mod:`src.pipeline.discovery.ingestion`.
 
     Paths/URLs are read and normalised with ``fetch_transactions``; in-memory
     frames go through ``sanitize_transactions`` (which reuses ingestion's alias
@@ -1153,12 +1153,12 @@ def handoff_to_features(
     *,
     velocity_window_seconds: float = 86_400.0,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Forward a canonical table to :mod:`src.data_pipeline.features`.
+    """Forward a canonical table to :mod:`src.pipeline.transform.features`.
 
     Returns the per-account feature table (feature mapping + scaling inputs)
     together with class-imbalance metadata used downstream for re-weighting.
     """
-    from src.data_pipeline.features import FEATURE_COLUMNS, compute_node_features
+    from src.pipeline.transform.features import FEATURE_COLUMNS, compute_node_features
 
     features = compute_node_features(df, velocity_window_seconds=velocity_window_seconds)
     counts = {int(k): int(v) for k, v in features["label"].value_counts().sort_index().items()}
@@ -1179,8 +1179,8 @@ def handoff_to_graph_builder(
     df: pd.DataFrame,
     **builder_kwargs: Any,
 ) -> tuple[Any, dict[str, Any]]:
-    """Hand raw edges/nodes to :mod:`src.data_pipeline.graph_builder` (PyG)."""
-    from src.data_pipeline.graph_builder import build_pyg_data
+    """Hand raw edges/nodes to :mod:`src.pipeline.transform.graph_builder` (PyG)."""
+    from src.pipeline.transform.graph_builder import build_pyg_data
 
     data, scaler = build_pyg_data(df, **builder_kwargs)
     info: dict[str, Any] = {
@@ -1354,7 +1354,7 @@ def list_candidate_datasets(
 
 def _canonicalise(df: pd.DataFrame) -> pd.DataFrame:
     """Rename columns to the canonical schema, best-effort."""
-    from src.data_pipeline.ingestion import _COLUMN_ALIASES
+    from src.pipeline.discovery.ingestion import _COLUMN_ALIASES
 
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
@@ -1635,7 +1635,7 @@ def fetch_to_pyg(
         ``(data, stats)`` where ``data`` is the PyG graph and ``stats`` is
         the dict produced by :func:`auto_fetch`.
     """
-    from src.data_pipeline.graph_builder import build_pyg_data
+    from src.pipeline.transform.graph_builder import build_pyg_data
 
     df, stats = auto_fetch(
         source=source,

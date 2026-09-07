@@ -3,7 +3,7 @@
 import pandas as pd
 import pytest
 
-from src.eval import (
+from src.pipeline.validation import (
     CANONICAL_SCHEMA,
     SCHEMA_ROLES,
     WEIGHTS,

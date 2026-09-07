@@ -12,13 +12,13 @@ import pytest
 import torch
 from torch_geometric.data import Data
 
-from src.eval import (
+from src.pipeline.validation import (
     DEFAULT_VERIFIER_CONFIG,
     detect_structural_trigger,
     summarise_verification,
     verify_predictions,
 )
-from src.eval.substructure_verifier import (
+from src.pipeline.validation.substructure_verifier import (
     _cycle_length_through,
     _density,
     _directed_adjacency,

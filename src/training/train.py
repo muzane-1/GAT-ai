@@ -18,8 +18,8 @@ import torch
 from sklearn.model_selection import train_test_split
 from torch import nn
 
-from src.data_pipeline import build_pyg_data, fetch_transactions
 from src.models import AdaptiveFocalLoss, GATv2GraphTransformer, GATv2Net
+from src.pipeline import build_pyg_data, fetch_transactions
 from src.utils import format_metrics, get_logger, load_config
 from src.utils.metrics import compute_metrics
 

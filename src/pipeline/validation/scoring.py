@@ -9,9 +9,9 @@ from typing import Any
 
 import pandas as pd
 
-from src.eval.health import evaluate_data_health
-from src.eval.schema import evaluate_schema_fit
-from src.eval.topology import evaluate_graph_topology
+from src.pipeline.validation.health import evaluate_data_health
+from src.pipeline.validation.schema import evaluate_schema_fit
+from src.pipeline.validation.topology import evaluate_graph_topology
 
 #: Relative importance of each sub-evaluator when ranking candidates.
 WEIGHTS: dict[str, float] = {
@@ -32,7 +32,7 @@ def evaluate_candidate_dataset(df_raw: pd.DataFrame) -> dict[str, Any]:
         Dict of scores — ``schema_fit``, ``data_health``, ``graph_topology``,
         ``aml_balance``, ``weighted_score`` — plus the raw ``nodes``,
         ``edges`` and ``aml_ratio`` metrics. The return shape is compatible
-        with the original ``src.data_pipeline.auto_fetch`` implementation so
+        with the original ``src.pipeline.discovery.auto_fetch`` implementation so
         existing callers keep working.
     """
     schema = evaluate_schema_fit(df_raw)

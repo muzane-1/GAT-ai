@@ -14,8 +14,8 @@ import torch
 from sklearn.preprocessing import StandardScaler
 from torch_geometric.data import Data
 
-from src.data_pipeline import features as feature_module
-from src.data_pipeline.positional_encoding import (
+from src.pipeline.transform import features as feature_module
+from src.pipeline.transform.positional_encoding import (
     laplacian_positional_encoding,
     random_walk_structural_encoding,
 )

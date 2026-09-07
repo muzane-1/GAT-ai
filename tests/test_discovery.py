@@ -16,7 +16,7 @@ from unittest import mock
 import pandas as pd
 import pytest
 
-AUTO_FETCH = import_module("src.data_pipeline.auto_fetch")
+AUTO_FETCH = import_module("src.pipeline.discovery.auto_fetch")
 
 
 @pytest.fixture(autouse=True)

@@ -118,8 +118,8 @@ def ensure_loaded(root: str = "data"):
         except (EmptyDataError, ValueError, OSError, RuntimeError):
             _purge_processed_cache()
     # Hard fallback on the canonical synthetic generator (smurfing motif).
-    from .data_pipeline.ingestion import generate_synthetic_transactions
-    from .data_pipeline.graph_builder import build_pyg_data
+    from .pipeline.discovery.ingestion import generate_synthetic_transactions
+    from .pipeline.transform.graph_builder import build_pyg_data
 
     df = generate_synthetic_transactions(n_accounts=200, n_transactions=400)
     data, _ = build_pyg_data(df)

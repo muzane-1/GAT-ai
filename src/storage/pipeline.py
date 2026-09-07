@@ -23,8 +23,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src.data_pipeline.graph_builder import build_pyg_data
-from src.data_pipeline.ingestion import CANONICAL_COLUMNS, normalize_columns
+from src.pipeline.discovery.ingestion import CANONICAL_COLUMNS, normalize_columns
+from src.pipeline.transform.graph_builder import build_pyg_data
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -188,7 +188,7 @@ def persist_transactions(
     """Sanitize, (optionally) log-normalize, and persist a transaction table.
 
     This is the single handoff point between dataset discovery
-    (``src.data_pipeline.auto_fetch``) and durable storage: it validates the
+    (``src.pipeline.discovery.auto_fetch``) and durable storage: it validates the
     canonical schema strictly, removes duplicates, applies log-scale
     normalization to ``amount`` and writes both Parquet and PyG ``.pt``
     artifacts under the Modal Volume mount.

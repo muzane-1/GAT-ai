@@ -7,18 +7,18 @@ import pytest
 import torch
 from torch_geometric.data import Data
 
-from src.data_pipeline.graph_builder import build_pyg_data
-from src.data_pipeline.ingestion import (
+from src.pipeline.discovery.ingestion import (
     CANONICAL_COLUMNS,
     fetch_transactions,
     generate_synthetic_transactions,
     normalize_columns,
 )
-from src.data_pipeline.positional_encoding import (
+from src.pipeline.transform.graph_builder import build_pyg_data
+from src.pipeline.transform.positional_encoding import (
     laplacian_positional_encoding,
     random_walk_structural_encoding,
 )
-from src.data_pipeline.sampling import make_neighbor_loader
+from src.pipeline.transform.sampling import make_neighbor_loader
 
 
 def test_synthetic_generation_schema() -> None:
@@ -57,7 +57,7 @@ def test_missing_columns_raise() -> None:
 
 def test_fetch_retries_then_fallback() -> None:
     """A permanently broken source falls back to synthetic data."""
-    with mock.patch("src.data_pipeline.ingestion.requests.get") as mocked_get:
+    with mock.patch("src.pipeline.discovery.ingestion.requests.get") as mocked_get:
         mocked_get.side_effect = RuntimeError("network down")
         df = fetch_transactions(
             "https://example.com/tx.csv",
@@ -72,7 +72,7 @@ def test_fetch_retries_then_fallback() -> None:
 
 def test_fetch_raises_when_fallback_disabled() -> None:
     """Fallback-to-synthetic is disabled → RuntimeError surfaces."""
-    with mock.patch("src.data_pipeline.ingestion.requests.get") as mocked_get:
+    with mock.patch("src.pipeline.discovery.ingestion.requests.get") as mocked_get:
         mocked_get.side_effect = RuntimeError("network down")
         with pytest.raises(RuntimeError):
             fetch_transactions(

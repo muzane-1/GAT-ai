@@ -1,187 +1,173 @@
-# GAT-ai — Graph Neural Network AML Detection
+# GAT-ai — Financial AML Graph AI Pipeline
 
-Production-grade PyTorch Geometric (PyG) Anti-Money Laundering detection built
-around a **GATv2** attention architecture with an adaptive Focal Loss to
-handle extreme class imbalance.
+Production-grade **Anti-Money Laundering (AML) detection** built as an
+end-to-end MLOps pipeline: multi-provider *data discovery* → Pandera-validated
+*ingestion & quality gates* → **PyTorch Geometric (PyG)** graph transformation →
+**GATv2** attention training with an adaptive Focal Loss for extreme class
+imbalance.
 
-## Repository layout
+The data plane is organised into **three explicit MLOps operational layers**
+under `src/pipeline/`:
 
-```
-config/config.yaml          # All parameters (model, loss, training, tuning, monitoring)
-src/
-  dataset.py                # Legacy PyG InMemoryDataset loader (HF fallback)
-  model.py                  # Legacy shim re-exporting GATv2 / GATv2AMLModel
-  utils/legacy.py           # Legacy FocalLoss, checkpoint helpers, compute_metrics
-  data_pipeline/            # ingestion / auto_fetch / features / graph_builder
-  ingestion/                # optional async Playwright JSON response scraper
-  storage/                  # JSONL cleaning and Parquet/PyG persistence
-  eval/                     # Dataset evaluation engine (schema / health / topology / scoring)
-  models/                   # GATv2Net and AdaptiveFocalLoss
-  training/                 # train.py, tune.py, and Modal GPU entry point
-  utils/                    # logger, metrics, config loader
-scripts/update_pipeline.py  # Checkpoint registry + metric drift + retrain trigger
-tests/                      # Unit tests for pipeline, models, training
-Dockerfile                  # Slim CPU-ready container
-.github/workflows/          # Lint -> tests -> 1-epoch dry-run -> Optuna smoke
-notebooks/                  # Interactive sandbox + validation notebooks
-train.py                    # Thin shim delegating to src.training.train
-```
-
-### Browser ingestion and Modal training
-
-`src.ingestion.scraper` provides bounded async Playwright scraping, JSON
-response interception, and storage-state reuse. CAPTCHA challenges are surfaced
-to callers; a caller may provide an approved token or local audio-solver
-callback. `src.storage.pipeline` converts JSONL transaction records to the
-canonical schema and writes Parquet/PyG artifacts. `src.training.modal_train`
-deploys the existing full-graph trainer with `project-data-vol` mounted at
-`/data` and accepts learning rate, batch size, and epoch overrides.
-
-## Automated Data Pipeline (API Ingestion)
-
-`src/data_pipeline/auto_fetch.py` orchestrates **agentic discovery** → fetch → sanitize → validate as
-four composable stages, so the training pipeline never hard-crashes on a
-missing or malformed remote dataset:
-
-1. **Agentic discovery & fetch** — `generate_search_queries()` plans a
-   deterministic cross-product of crypto assets × AML/graph terms × output
-   formats; `discover_candidates()` fans the queries out to Kaggle, GitHub,
-   Hugging Face and a keyless web search; `discover_and_verify()` downloads
-   the top-K candidates and re-scores them on the raw bytes. `auto_fetch()`
-   then resolves a source in priority order — explicit local path / URL →
-   HF dataset id → dynamically discovered candidates → deterministic synthetic
-   generator.
-2. **Sanitation** — `sanitize_transactions()` normalises column aliases into
-   the canonical schema (`tx_id, src, dst, amount, timestamp,
-   is_laundering`), parses/coerces types, clips negative amounts, drops
-   duplicate edges, and fills missing ids/labels/timestamps. `auto_fetch()`
-   optionally applies a `log1p` amount normalisation.
-3. **Validation** — `validate_transactions()` computes node/edge counts,
-   undirected connectivity (scipy), null-cell count, and the AML class
-   ratio; `fetch_to_pyg()` converts the verified table into a PyG `Data`
-   object via the canonical `graph_builder`.
-
-```python
-from src.data_pipeline import auto_fetch, fetch_to_pyg
-
-df, stats = auto_fetch(hf_query="qubit420/ibm-aml-LI-smaller")
-data, graph_stats = fetch_to_pyg(hf_query="qubit420/ibm-aml-LI-smaller")
-```
-
-## Agentic Dataset Discovery Pipeline
-
-`src/data_pipeline/auto_fetch.py` also exposes a standalone, fully-typed
-agentic discovery layer that searches public sources and returns **verified**
-dataset metadata + raw download paths:
-
-- **Query planner** — `generate_search_queries()` deterministically builds
-  `[Crypto Asset (BTC, ETH, Solana)] + [AML/Graph terms (transaction graph,
-  illicit, money laundering, fraud)] + [Formats (CSV, Parquet, PyG, NetworkX)]`
-  combinations; an LLM-backed planner can swap in behind the same signature.
-
-- **Providers** — `discover_candidates()` fans queries out to:
-  - **Kaggle** (official `kaggle` client — `pip install kaggle` — requiring
-    `KAGGLE_USERNAME`/`KAGGLE_KEY`),
-  - **GitHub** Search API (optionally authenticated with `GITHUB_TOKEN`),
-  - **Hugging Face** Hub (always queried, via `HfApi.list_datasets`),
-  - **Web** (keyless DuckDuckGo HTML endpoint, best-effort).
-  Each provider call is guarded (network failures degrade gracefully) and
-  cached for 300s; results are de-duplicated by id and ranked by a metadata
-  heuristic.
-
-- **Reliability gates (strict)** — `assess_reliability()` scores every candidate
-  0-100 (:data:`MIN_QUALITY_SCORE = 60`) using the repository's eval engine
-  (schema fit / data health / graph topology / class balance) plus:
-    - `has_explicit_label` — the table must expose an explicit target label
-      (`label`, `is_illicit`, `is_laundering`, `is_fraud`, ...), and
-    - `has_edge_connections` — both `source`/`target`-style edge columns must be
-      present. Candidates failing either gate are **hard-rejected**, never handed
-      downstream.
-
-
-
-- **Verified handoff** — `discover_and_verify(top_k=3)` downloads the top-K
-  raw files into `data/discovery/`, re-scores them on the actual bytes and returns
-  `VerifiedDataset` records; `verified_summary()` flattens them into JSON-safe
-  metadata (local paths included). The pipeline-integration helpers
-  pass raw materials straight into the existing modules:
-  `handoff_to_ingestion()` → `src.data_pipeline.ingestion` (schema normalisation),
-  `handoff_to_graph_builder()` → `src.data_pipeline.graph_builder` (PyG `Data`),
-  `handoff_to_features()` → `src.data_pipeline.features` (scaling/class imbalance/
-  feature mapping), and `handoff()` runs all three in sequence.
-
-```python
-from src.data_pipeline import discover_and_verify, verified_summary
-
-verified = discover_and_verify(  # offline=True in CI/key-less environments
-    providers="kaggle,github,web",  # or AML_DISCOVERY_PROVIDERS env var
-    top_k=3,
-    offline=False,
-)
-summary = verified_summary(verified)
-# [{'id': 'github:acme/aml-graphs', 'quality_score': 92.0,
-#   'has_explicit_label': True, 'has_edge_connections': True,
-#   'local_path': 'data/discovery/aml-graphs.csv', ...}, ...]
-```
-
-All discovery calls fail safely: when no internet, no API keys, or every
-candidate fails the gates, the pipeline falls back to the deterministic synthetic
-generator (`--offline` / no credentials),so CI (`verify_readiness.py`) stays
-deterministic and green.
-
-## Dataset Evaluation Engine (`src.eval`)
-
-The dataset-quality logic extracted in `src/eval/` scores **raw, unsanitised**
-candidate tables *before* the ingestion pipeline makes its hard validation
-checks — this is how `auto_fetch()` ranks multiple Hugging Face candidates and
-picks the best one. Each module is a single, testable concern:
-
-| Module | Evaluator | What it measures |
+| Layer | Package | Responsibility |
 |---|---|---|
-| `src/eval/schema.py` | `evaluate_schema_fit()` | How much of the canonical schema (`tx_id, src, dst, amount, timestamp, is_laundering`) is present, mapping columns case-/whitespace-insensitively via `SCHEMA_ROLES` aliases (`source`, `target`, `value`, `label`, ...). Exposes `resolve_column()` and `CANONICAL_SCHEMA`. |
-| `src/eval/health.py` | `evaluate_data_health()` | Non-null ratio, share of strictly positive amounts, and parseable-timestamp ratio (degrades gracefully to 0 on unparseable timestamps). |
-| `src/eval/topology.py` | `evaluate_graph_topology()` | Node/edge counts, connectivity ratio (edges per node, capped at 1), AML class ratio and `aml_balance` — a useful class ratio is strictly between 0 and 0.5. |
-| `src/eval/scoring.py` | `evaluate_candidate_dataset()` | Aggregates the above into a single `weighted_score` using `WEIGHTS = {schema_fit: 0.3, data_health: 0.3, graph_topology: 0.2, aml_balance: 0.2}`, plus raw `nodes`, `edges` and `aml_ratio` metrics. |
+| **1. Discovery & Ingestion** | `src/pipeline/discovery/` | Agentic dataset discovery (Kaggle / GitHub / Hugging Face / keyless web), bounded async Playwright scraping with CAPTCHA-challenge surfacing, CSV/HF fetching, deterministic synthetic fallback, LangGraph/CrewAI-ready agent nodes |
+| **2. Validation & Quality** | `src/pipeline/validation/` | **Pandera** schema contract (`src`/`dst`/`from_address`/`to_address`, `amount`, `timestamp`, `is_laundering`), dataset-quality scoring (schema / health / topology), PyG **substructure verifier** (directed cycles, smurfing fans, k-core) |
+| **3. Orchestration & Pipeline** | `src/pipeline/orchestration/` | Step-based `fetch → validate → transform` execution — ZenML / Kedro compatible `@step` wrappers with declared artifact inputs/outputs |
 
-The return shape of `evaluate_candidate_dataset()` is backward compatible with
-the original `src.data_pipeline.auto_fetch` implementation, so existing callers
-(and tests) keep working.
+The shared **graph transformation kernel** (`src/pipeline/transform/`) converts
+validated transaction tables into PyG `Data` objects with topology features and
+positional encodings.
 
-```python
-from src.eval import evaluate_candidate_dataset
+## Directory Structure
 
-scores = evaluate_candidate_dataset(df_raw)
-# {'schema_fit': 1.0, 'data_health': 0.98, 'graph_topology': ...,
-#  'aml_balance': 1.0, 'weighted_score': 0.99, 'nodes': 120, ...}
+```
+GAT-ai/
+├── config/
+│   └── config.yaml              # Single source of truth: model, loss, training, data, monitoring
+├── data/                        # (gitignored) raw / discovery / processed artifacts
+├── scripts/
+│   ├── update_pipeline.py       # Checkpoint registry + metric drift + retrain trigger
+│   └── verify_readiness.py      # Deterministic end-to-end readiness check
+├── src/
+│   ├── pipeline/                # ── THE DATA PLANE (3 MLOps layers) ──
+│   │   ├── discovery/           #   Layer 1: auto_fetch, scraper (Playwright), ingestion, agents
+│   │   ├── validation/          #   Layer 2: pandera_schema, quality scoring, substructure_verifier
+│   │   ├── transform/           #   Kernel:  features, graph_builder, positional_encoding, sampling
+│   │   ├── orchestration/       #   Layer 3: steps.py (@step), pipeline.py (fetch → validate → transform)
+│   │   └── __init__.py          #   Facade re-exporting the full public API
+│   ├── models/                  # GATv2Net, GATv2GraphTransformer, AdaptiveFocalLoss
+│   ├── training/                # train.py, tune.py (Optuna), modal_train.py (GPU)
+│   ├── storage/                 # JSONL cleaning + Parquet/PyG persistence (Modal Volume backed)
+│   ├── utils/                   # config loader, logger, metrics, legacy shims
+│   ├── dataset.py               # Legacy PyG InMemoryDataset loader (HF fallback)
+│   └── model.py                 # Legacy shim re-exporting GATv2 / GATv2AMLModel
+├── tests/                       # pytest suite (pipeline, agents, pandera, orchestration, models, training)
+├── notebooks/                   # EDA, prototyping, attention visualisation, pipeline validation
+├── train.py                     # Thin shim delegating to src.training.train
+├── Dockerfile                   # Slim CPU container doubling as the CI executor
+└── .github/workflows/ci.yml     # ruff → mypy → bandit → pytest --cov → nbconvert → 1-epoch → Optuna smoke
 ```
 
-## Notebooks
+## MLOps Tool Stack
 
-| Notebook | Purpose |
+| Concern | Tools |
 |---|---|
-| `01_data_exploration.ipynb` | Graph topology + class-distribution EDA |
-| `02_model_prototyping.ipynb` | Dry-run forward pass + short training loop |
-| `03_visualize_attention.ipynb` | Attention weights + embedding projection |
-| `04_data_pipeline_validation.ipynb` | Auto-fetch sanitation & validation checks |
+| **Discovery** | Playwright (async scraping + CAPTCHA audio-solver hooks), LangGraph / CrewAI (agent node scaffolding in `discovery/agents.py`), `huggingface_hub`, Kaggle & GitHub Search APIs |
+| **Validation** | **Pandera** (`validation/pandera_schema.py`), PyG **Substructure Verifier** (`validation/substructure_verifier.py`), scipy connectivity checks |
+| **Orchestration** | ZenML / Kedro-compatible step wrappers (`orchestration/steps.py`), Optuna (HPO), Modal (remote GPU), GitHub Actions + Docker (CI) |
+| **ML** | PyTorch Geometric (PyG) — GATv2 attention, NeighborLoader sampling, Laplacian / random-walk positional encodings, adaptive Focal Loss |
 
-## Quick start
+## The 3-Layer Pipeline
+
+```python
+from src.pipeline import run_pipeline
+
+# One call executes fetch → validate → transform.
+# Without a source it deterministically falls back to the synthetic generator.
+catalog = run_pipeline()
+graph = catalog["graph"]  # torch_geometric.data.Data
+report = catalog["validation_report"]  # rows / nodes / aml_ratio / pandera gate
+```
+
+### Layer 1 — Discovery & Ingestion (`src/pipeline/discovery/`)
+
+```python
+from src.pipeline.discovery import (
+    discover_and_verify,
+    fetch_transactions,
+    verified_summary,
+    PlaywrightScraper,
+    ScraperConfig,
+    run_discovery_agents,
+)
+
+# Agentic discovery: plan queries → fan out to providers → verify raw bytes.
+verified = discover_and_verify(providers="kaggle,github,web", top_k=3, offline=False)
+summary = verified_summary(verified)  # quality_score, has_explicit_label, local_path, ...
+
+# LangGraph / CrewAI-ready: the same logic as plan → discover → verify nodes.
+state = run_discovery_agents({"offline": True, "assets": ["btc"], "aml_terms": ["aml"]})
+# build_discovery_graph() returns a compiled langgraph StateGraph when
+# `langgraph` is installed, else a dependency-free sequential executor.
+```
+
+`scraper.py` captures JSON responses from JavaScript-rendered pages with
+storage-state reuse. CAPTCHAs are never bypassed silently: the challenge is
+surfaced to a caller-supplied `audio_solver` (audio CAPTCHA solving) or
+`captcha_token`. Every remote path fails safely into the deterministic
+synthetic generator, so CI stays green without credentials.
+
+### Layer 2 — Validation & Quality (`src/pipeline/validation/`)
+
+```python
+from src.pipeline.validation import evaluate_candidate_dataset, validate_transaction_schema
+
+validated = validate_transaction_schema(
+    raw_df
+)  # Pandera gate (aliases incl. from_address/to_address)
+scores = evaluate_candidate_dataset(raw_df)  # schema_fit / health / topology / weighted_score
+```
+
+`substructure_verifier.py` cross-checks GNN predictions against local AML
+motifs (directed cycles, smurfing fans, dense k-core subgraphs) and fires an
+independent retrain trigger from `scripts/update_pipeline.py`.
+
+### Layer 3 — Orchestration (`src/pipeline/orchestration/`)
+
+```python
+from src.pipeline.orchestration import build_default_pipeline, validate_step
+
+pipeline = build_default_pipeline()  # [fetch_step, validate_step, transform_step]
+catalog = pipeline.run(source="data/raw/transactions.csv")
+
+# Every step is a ZenML / Kedro compatible unit with declared artifacts:
+validate_step.inputs  # ("raw_df",)               <- threaded through the catalog
+validate_step.outputs  # ("validated_df", "validation_report")
+```
+
+## Quickstart
 
 ```bash
+# 1. Install (CPU)
+pip install "torch>=2.2,<2.8" --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
-python train.py --epochs 100
+
+# 2. Tests (full suite)
+python -m pytest tests/
+
+# 3. Run the full data pipeline (fetch → validate → transform)
+python -c "from src.pipeline import run_pipeline; print(run_pipeline()['validation_report'])"
+
+# 4. Fetch live datasets (discovery layer; keyless providers, safe fallback)
+python -c "from src.pipeline.discovery import discover_and_verify, verified_summary; \
+print(verified_summary(discover_and_verify(top_k=3)))"
+
+# 5. Train / tune / monitor
+python -m src.training.train --epochs 100
 python -m src.training.tune --trials 50 --epochs 100
-python scripts/update_pipeline.py
+python scripts/update_pipeline.py  # drift monitor + retrain trigger
 ```
+
+## Model & Training
+
+`src/models/` implements a **GATv2** attention network (plus a hybrid graph
+transformer variant) with edge-feature injection and an **AdaptiveFocalLoss**
+whose α/γ adapt to the observed FN/FP trade-off. Node features (9 behavioural
++ topological columns) are standard-scaled; edge features carry the scaled
+amount and a normalised timestamp delta. Configuration lives exclusively in
+`config/config.yaml`.
 
 ## Legacy compatibility
 
 Notebooks written against the previous layout keep working: `src.dataset`,
-`src.model`, and `src.utils` remain importable with the same legacy symbols
-(`GATv2`, `GATv2AMLModel`, `FocalLoss`, `compute_metrics`, checkpoint helpers).
-The root `train.py` is preserved as a shim.
+`src.model`, and `src.utils` remain importable with the same legacy symbols,
+and the `src.pipeline` facade re-exports the entire former
+`src.data_pipeline` / `src.ingestion` / `src.eval` public API.
 
 ## CI
 
-The GitHub Actions workflow builds the Docker image, runs `ruff`, executes
-`pytest`, a 1-epoch training dry-run, and an Optuna smoke trial — all inside
-the container.
+The GitHub Actions workflow builds the Docker image and runs `ruff` (lint +
+format), `mypy`, `bandit`, `pytest --cov` (≥80%), headless notebook execution,
+a 1-epoch training dry-run, and an Optuna smoke trial — all inside the
+container.

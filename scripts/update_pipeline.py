@@ -122,7 +122,7 @@ def register_checkpoint(registry_path: Path, checkpoint_path: str, metrics: dict
 
 def _load_verification_graph(config: dict[str, Any]) -> Any:
     """Load the persisted PyG artifact, falling back to ``fetch_to_pyg``."""
-    from src.data_pipeline import fetch_to_pyg
+    from src.pipeline import fetch_to_pyg
     from src.storage.pipeline import get_data_mount, load_pyg_dataset
 
     artifact = get_data_mount() / "transactions.pt"
@@ -193,7 +193,7 @@ def run_structural_verification(config: dict[str, Any]) -> dict[str, Any] | None
     try:
         import torch
 
-        from src.eval import (
+        from src.pipeline.validation import (
             SubstructureVerifierConfig,
             detect_structural_trigger,
             summarise_verification,

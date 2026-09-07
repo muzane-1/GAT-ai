@@ -9,7 +9,7 @@ from typing import Any
 
 import pandas as pd
 
-from src.eval.schema import resolve_column
+from src.pipeline.validation.schema import resolve_column
 
 
 def evaluate_data_health(df: pd.DataFrame) -> dict[str, Any]:

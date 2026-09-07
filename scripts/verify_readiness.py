@@ -19,8 +19,8 @@ import yaml
 from torch_geometric import typing as pyg_typing
 from torch_geometric.loader import DataLoader, NeighborLoader
 
-from src.data_pipeline import fetch_to_pyg
 from src.models import AdaptiveFocalLoss, GATv2Net
+from src.pipeline import fetch_to_pyg
 
 
 def _load_config(config_path: str | Path) -> dict[str, Any]:

@@ -1,0 +1,89 @@
+"""Layer 1 — Discovery & Ingestion.
+
+Agentic dataset discovery (Kaggle / GitHub / Hugging Face / web), bounded
+async Playwright scraping with CAPTCHA-challenge surfacing, CSV/HTTP
+transaction fetching with a deterministic synthetic fallback, and the
+LangGraph/CrewAI-ready agent scaffolding in :mod:`.agents`.
+"""
+
+from src.pipeline.discovery.agents import (
+    DISCOVERY_NODES,
+    DiscoveryState,
+    SequentialDiscoveryGraph,
+    build_discovery_graph,
+    discover_node,
+    plan_queries_node,
+    run_discovery_agents,
+    verify_node,
+)
+from src.pipeline.discovery.auto_fetch import (
+    DatasetCandidate,
+    assess_reliability,
+    auto_fetch,
+    candidates_from_json_records,
+    discover_and_verify,
+    discover_candidates,
+    fetch_to_pyg,
+    generate_search_queries,
+    handoff,
+    handoff_to_storage,
+    list_candidate_datasets,
+    sanitize_transactions,
+    search_web_browser,
+    search_web_resilient,
+    validate_transactions,
+    verified_summary,
+    verify_candidates,
+)
+from src.pipeline.discovery.ingestion import (
+    CANONICAL_COLUMNS,
+    fetch_transactions,
+    generate_synthetic_transactions,
+    normalize_columns,
+)
+from src.pipeline.discovery.scraper import (
+    AudioSolver,
+    CaptchaChallenge,
+    PlaywrightScraper,
+    ScraperConfig,
+    scrape_urls,
+    write_jsonl,
+)
+
+__all__ = [
+    "AudioSolver",
+    "CANONICAL_COLUMNS",
+    "CaptchaChallenge",
+    "DISCOVERY_NODES",
+    "DatasetCandidate",
+    "DiscoveryState",
+    "PlaywrightScraper",
+    "ScraperConfig",
+    "SequentialDiscoveryGraph",
+    "assess_reliability",
+    "auto_fetch",
+    "build_discovery_graph",
+    "candidates_from_json_records",
+    "discover_and_verify",
+    "discover_candidates",
+    "discover_node",
+    "fetch_to_pyg",
+    "fetch_transactions",
+    "generate_search_queries",
+    "generate_synthetic_transactions",
+    "handoff",
+    "handoff_to_storage",
+    "list_candidate_datasets",
+    "normalize_columns",
+    "plan_queries_node",
+    "run_discovery_agents",
+    "sanitize_transactions",
+    "scrape_urls",
+    "search_web_browser",
+    "search_web_resilient",
+    "validate_transactions",
+    "verified_summary",
+    "verify_candidates",
+    "verify_node",
+    "write_jsonl",
+]

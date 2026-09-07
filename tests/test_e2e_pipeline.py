@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.data_pipeline.ingestion import CANONICAL_COLUMNS, generate_synthetic_transactions
+from src.pipeline.discovery.ingestion import CANONICAL_COLUMNS, generate_synthetic_transactions
 from src.storage import pipeline as storage_pipeline
 from src.training import modal_train
 from src.training.train import train_model
@@ -24,8 +24,8 @@ from src.utils import load_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-AUTO_FETCH = import_module("src.data_pipeline.auto_fetch")
-SCRAPER = import_module("src.ingestion.scraper")
+AUTO_FETCH = import_module("src.pipeline.discovery.auto_fetch")
+SCRAPER = import_module("src.pipeline.discovery.scraper")
 
 
 def _valid_frame() -> pd.DataFrame:
@@ -56,7 +56,7 @@ def _clear_discovery_cache() -> None:
 def test_network_failure_falls_back_to_synthetic_graph() -> None:
     """A dead network at every remote path still yields a valid PyG graph."""
     with mock.patch(
-        "src.data_pipeline.ingestion.requests.get",
+        "src.pipeline.discovery.ingestion.requests.get",
         side_effect=RuntimeError("network down"),
     ):
         data, stats = AUTO_FETCH.fetch_to_pyg(sources=["https://unreachable.invalid/tx.csv"])
@@ -91,7 +91,7 @@ def test_scraper_failure_degrades_search_to_empty() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. Discovery → Playwright delegation (src.ingestion.scraper)
+# 2. Discovery → Playwright delegation (src.pipeline.discovery.scraper)
 # ---------------------------------------------------------------------------
 
 
