@@ -10,6 +10,7 @@ trains directly on the sanitized artifacts written by ``src.storage.pipeline``:
 from __future__ import annotations
 
 import argparse
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -92,10 +93,17 @@ if modal is not None:
             return train_model(config, epochs=epochs, data=data, scaler=scaler)
 
         frame = payload
-        local_csv = "/tmp/transactions.csv"
-        frame.to_csv(local_csv, index=False)
-        config["data"]["raw_source"] = local_csv
-        return train_model(config, epochs=epochs)
+        # B108: never hardcode /tmp — resolve a platform-appropriate temp file.
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", prefix="aml_transactions_", delete=False, encoding="utf-8"
+        ) as handle:
+            local_csv = handle.name
+        try:
+            frame.to_csv(local_csv, index=False)
+            config["data"]["raw_source"] = local_csv
+            return train_model(config, epochs=epochs)
+        finally:
+            Path(local_csv).unlink(missing_ok=True)
 else:
     image = volume = app = None
 
