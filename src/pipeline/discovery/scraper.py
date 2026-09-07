@@ -53,6 +53,7 @@ class PlaywrightScraper:
     audio_solver: AudioSolver | None = None
     _browser: Any = field(default=None, init=False, repr=False)
     _context: Any = field(default=None, init=False, repr=False)
+    _playwright: Any = field(default=None, init=False, repr=False)
 
     async def __aenter__(self) -> PlaywrightScraper:
         try:
@@ -82,7 +83,7 @@ class PlaywrightScraper:
             await self._context.storage_state(path=str(state_path))
         if self._browser is not None:
             await self._browser.close()
-        if hasattr(self, "_playwright"):
+        if self._playwright is not None:
             await self._playwright.stop()
 
     async def scrape_json(
@@ -214,9 +215,10 @@ class PlaywrightScraper:
         """Use a supplied local solver or token; otherwise fail explicitly."""
         token = self.config.captcha_token
         if token is None and challenge.audio_url and self.audio_solver is not None:
-            token = self.audio_solver(challenge.audio_url)
-            if inspect.isawaitable(token):
-                token = await token
+            solved: str | None | Awaitable[str | None] = self.audio_solver(challenge.audio_url)
+            if inspect.isawaitable(solved):
+                solved = await solved
+            token = solved
         if not token:
             raise RuntimeError(
                 f"{challenge.provider} detected; provide captcha_token or a local audio_solver"

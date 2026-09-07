@@ -21,7 +21,7 @@ Plugging an LLM planner (LangGraph node, CrewAI agent, ...) means replacing
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, TypedDict
+from typing import Any, TypedDict, cast
 
 from src.pipeline.discovery.auto_fetch import (
     DatasetCandidate,
@@ -131,7 +131,7 @@ class SequentialDiscoveryGraph:
         merged: DiscoveryState = dict(state or {})  # type: ignore[assignment]
         for name, fn in self._nodes:
             update = fn(merged)
-            merged.update(update)
+            merged.update(cast(DiscoveryState, update))
             logger.info("agent_node_completed", extra={"node": name})
         return merged
 

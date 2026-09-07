@@ -407,7 +407,8 @@ def candidates_from_json_records(
     for record in records:
         if not isinstance(record, dict):
             continue
-        items = record.get("items") if isinstance(record.get("items"), list) else [record]
+        raw_items = record.get("items")
+        items: list[Any] = list(raw_items) if isinstance(raw_items, list) else [record]
         for item in items:
             if not isinstance(item, dict):
                 continue
