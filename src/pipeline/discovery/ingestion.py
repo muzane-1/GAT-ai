@@ -10,6 +10,7 @@ positive, ``timestamp`` is a UNIX epoch (seconds) or an ISO-8601 string, and
 normalised on load so notebooks built on older naming keep working.
 """
 
+import difflib
 import time
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,73 @@ _COLUMN_ALIASES: dict[str, str] = {
     "is_launder": "is_laundering",
     "laundering": "is_laundering",
 }
+
+#: Critical columns — the pipeline cannot proceed if these are entirely absent.
+CRITICAL_COLUMNS: tuple[str, ...] = ("src", "dst", "amount", "is_laundering")
+
+#: Minimum fuzzy-match confidence to auto-accept a column mapping.
+FUZZY_MATCH_THRESHOLD: float = 0.6
+
+#: Warn (but continue) when an auto-mapping falls below this confidence.
+FUZZY_WARN_THRESHOLD: float = 0.8
+
+
+def _normalise_header(name: str) -> str:
+    """Lowercase + strip separators so 'Amount Paid' ~ 'amount_paid' ~ 'amount'."""
+    return "".join(ch for ch in str(name).strip().lower() if ch.isalnum())
+
+
+def fuzzy_map_columns(
+    columns: list[str],
+    *,
+    threshold: float = FUZZY_MATCH_THRESHOLD,
+) -> dict[str, tuple[str, float]]:
+    """Map arbitrary dataset headers onto canonical columns via fuzzy matching.
+
+    Exact alias hits (``_COLUMN_ALIASES`` + canonical names) win first at
+    confidence 1.0.  Remaining headers are compared with
+    :func:`difflib.SequenceMatcher` against canonical names *and* known
+    aliases (normalised: case/separator-insensitive).  Returns
+    ``{raw_column: (canonical, confidence)}`` for matches at/above
+    ``threshold``; low-confidence columns are skipped with a warning log
+    (never a hard stop here — the caller decides on critical columns).
+    """
+    mapping: dict[str, tuple[str, float]] = {}
+    used_canonical: set[str] = set()
+    # Candidate pool: canonical names plus every known alias spelling.
+    pool: dict[str, str] = {c: c for c in CANONICAL_COLUMNS}
+    for alias, canonical in _COLUMN_ALIASES.items():
+        pool.setdefault(alias, canonical)
+    pool_norm = {_normalise_header(k): v for k, v in pool.items()}
+
+    for raw in columns:
+        key = str(raw)
+        norm = _normalise_header(key)
+        if norm in pool_norm and pool_norm[norm] not in used_canonical:
+            mapping[key] = (pool_norm[norm], 1.0)
+            used_canonical.add(pool_norm[norm])
+            continue
+        best: tuple[str, float] | None = None
+        for probe, canonical in pool_norm.items():
+            if canonical in used_canonical:
+                continue
+            ratio = difflib.SequenceMatcher(None, norm, probe).ratio()
+            if best is None or ratio > best[1]:
+                best = (canonical, ratio)
+        if best is not None and best[1] >= threshold:
+            mapping[key] = best
+            used_canonical.add(best[0])
+            if best[1] < FUZZY_WARN_THRESHOLD:
+                logger.warning(
+                    "fuzzy_column_mapping_low_confidence",
+                    extra={"column": key, "mapped_to": best[0], "confidence": round(best[1], 3)},
+                )
+        else:
+            logger.warning(
+                "fuzzy_column_mapping_no_match",
+                extra={"column": key, "best_guess": best[0] if best else None},
+            )
+    return mapping
 
 
 def generate_synthetic_transactions(
@@ -121,6 +189,13 @@ def generate_synthetic_transactions(
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Rename aliased columns to the canonical schema and validate it.
 
+    Static ``_COLUMN_ALIASES`` hits apply first; any still-missing canonical
+    column is resolved with fuzzy header matching
+    (:func:`fuzzy_map_columns`, e.g. ``"Amount Paid"`` → ``amount``,
+    ``"From Bank"`` → ``src``).  Low-confidence fuzzy hits log a warning but
+    never stop the pipeline; only a completely missing *critical* column
+    (``amount``/``src``/``dst``/``is_laundering``) raises.
+
     Args:
         df: Raw transaction table.
 
@@ -133,7 +208,22 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns=_COLUMN_ALIASES)
     missing = [col for col in CANONICAL_COLUMNS if col not in df.columns]
     if missing:
-        raise ValueError(f"Missing required columns after normalisation: {missing}")
+        fuzzy = fuzzy_map_columns([str(c) for c in df.columns])
+        rename: dict[str, str] = {}
+        for raw, (canonical, _conf) in fuzzy.items():
+            if canonical in missing and raw in df.columns:
+                rename[raw] = canonical
+        if rename:
+            logger.info("fuzzy_column_mapping_applied", extra={"mapping": rename})
+            df = df.rename(columns=rename)
+        missing = [col for col in CANONICAL_COLUMNS if col not in df.columns]
+    if missing:
+        critical = [c for c in missing if c in CRITICAL_COLUMNS]
+        if critical:
+            raise ValueError(f"Missing required columns after normalisation: {missing}")
+        logger.warning("noncritical_columns_missing", extra={"missing": missing})
+        for col in missing:
+            df[col] = 0 if col != "tx_id" else range(len(df))
 
     if pd.api.types.is_string_dtype(df["timestamp"]):
         df["timestamp"] = pd.to_datetime(df["timestamp"]).astype("int64") // 10**9

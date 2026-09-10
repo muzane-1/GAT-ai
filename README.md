@@ -139,9 +139,12 @@ python -m pytest tests/
 # 3. Run the full data pipeline (fetch → validate → transform)
 python -c "from src.pipeline import run_pipeline; print(run_pipeline()['validation_report'])"
 
-# 4. Fetch live datasets (discovery layer; keyless providers, safe fallback)
-python -c "from src.pipeline.discovery import discover_and_verify, verified_summary; \
-print(verified_summary(discover_and_verify(top_k=3)))"
+# 4. Fully automated discovery (no manual uploads, no human-in-the-loop)
+python -c "from src.pipeline.discovery import auto_discover_source; \
+print(auto_discover_source(top_k=5)['status'])"
+# Optional: enable Kaggle search by exporting credentials; the system works
+# fully automatically WITHOUT them (auto-skips to HuggingFace/GitHub/web):
+#   export KAGGLE_USERNAME=<username> KAGGLE_KEY=<api-key>  (or set in .env)
 
 # 5. Train / tune / monitor
 python -m src.training.train --epochs 100

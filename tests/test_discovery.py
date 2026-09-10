@@ -315,7 +315,13 @@ def test_gnn_train_step_and_model_factory() -> None:
     )
     data.batch_size = 4
     for arch in ("gatv2", "graphsage"):
-        model = build_gnn_model(arch, in_channels=9, hidden_channels=16, num_layers=1)
+        model = build_gnn_model(
+            arch,
+            in_channels=9,
+            hidden_channels=16,
+            num_layers=1,
+            edge_dim=int(data.edge_attr.shape[1]) if data.edge_attr is not None else None,
+        )
         before = [p.detach().clone() for p in model.parameters()]
         criterion = AdaptiveFocalLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)

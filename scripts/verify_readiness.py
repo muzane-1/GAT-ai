@@ -19,7 +19,6 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import torch
 import torch.nn.functional as F
 import yaml
@@ -28,6 +27,7 @@ from torch_geometric.loader import DataLoader, NeighborLoader
 
 from src.models import AdaptiveFocalLoss
 from src.pipeline.discovery.auto_fetch import (
+    auto_discover_source,
     discover_candidates,
     score_data_source_quality,
     select_source,
@@ -61,70 +61,36 @@ def _fetch_real_candidates(
 ) -> tuple[pd.DataFrame | None, dict[str, Any]]:
     """Fetch the best real transaction table via the automated quality gate.
 
-    Resolution (zero manual intervention):
-    1. Explicit ``source`` CSV/URL when given.
-    2. Otherwise agentic discovery (short single-keyword HF fan-out + Kaggle
-       credentials with automatic public-HF fallback), download + sanitize
-       each candidate, ``score_data_source_quality`` them and ``select_source``
-       the best real table at/above the quality floor.
-    3. ``(None, {"provenance": "synthetic-fallback"})`` when nothing real
-       passes, so the caller can use the crash-resilient synthetic generator.
+    Fully automatic orchestrator (zero manual intervention, no uploads):
+    explicit ``source`` CSV/URL wins when given, otherwise
+    :func:`auto_discover_source` runs search → score → auto-select with an
+    audit-logged decision and automatic next-best-real / synthetic fallback.
     """
-    from src.pipeline.discovery.auto_fetch import (
-        _load_candidate,
-        sanitize_transactions,
-        validate_transactions,
-        verify_candidates,
-    )
-
     if source:
         from src.pipeline.discovery.ingestion import fetch_transactions
 
         df = fetch_transactions(source=source, fallback_generate=False)
         return df, {"provenance": f"source:{source}", "selection": "explicit"}
 
-    candidates = discover_candidates(max_queries=8, per_provider_limit=4)
-    if not candidates:
-        return None, {"provenance": "synthetic-fallback", "reason": "no candidates discovered"}
-    verified = verify_candidates(
-        candidates, "data/discovery", top_k=min(limit, len(candidates)), strict=False
-    )
-    scored: list[tuple[Any, float]] = []
-    frames: dict[str, pd.DataFrame] = {}
-    # Reuse already-downloaded raw tables (no second download per candidate).
-    for item in verified:
-        try:
-            if item.raw_df is None:
-                continue
-            frame = sanitize_transactions(item.raw_df)
-            validate_transactions(frame)
-            gate = score_data_source_quality(frame)
-            scored.append((item.candidate, float(gate["quality_score"])))
-            frames[item.candidate.id] = frame
-        except Exception:  # noqa: BLE001 - candidate isolation is intentional
-            continue
-    if not scored:
-        # Fall back to direct loads for a bounded number of undiscovered raws.
-        for candidate in candidates[:3]:
-            try:
-                raw = _load_candidate(
-                    candidate.download_url or candidate.url or candidate.id, None
-                )
-                frame = sanitize_transactions(raw)
-                validate_transactions(frame)
-                gate = score_data_source_quality(frame)
-                scored.append((candidate, float(gate["quality_score"])))
-                frames[candidate.id] = frame
-            except Exception:  # noqa: BLE001 - candidate isolation is intentional
-                continue
-    best = select_source(scored)
-    if best is None:
-        return None, {"provenance": "synthetic-fallback", "reason": "quality gate rejected all"}
-    return frames[best.id], {
-        "provenance": f"{best.provider}:{best.id}",
-        "selection": "score_data_source_quality+select_source",
-        "quality_score": max(score for _, score in scored),
-        "n_scored": len(scored),
+    from src.pipeline.discovery.auto_fetch import auto_discover_source
+
+    result = auto_discover_source(top_k=limit)
+    if result["status"] in ("selected", "fallback_real") and result.get("raw_df") is not None:
+        frame = result["raw_df"]
+        best_id = result["candidate"].id
+        return frame, {
+            "provenance": f"{result['candidate'].provider}:{best_id}",
+            "selection": f"auto_discover_source:{result['status']}",
+            "quality_score": next(
+                (a["quality_score"] for a in result["scored"] if a["id"] == best_id), None
+            ),
+            "n_scored": len(result["scored"]),
+            "decision_log": result["decision_log"],
+        }
+    return None, {
+        "provenance": "synthetic-fallback",
+        "reason": result.get("reason", result["status"]),
+        "decision_log": result.get("decision_log", []),
     }
 
 
@@ -160,14 +126,26 @@ def dry_run(
         stats["fetch_info"] = fetch_info
         stats["real_data"] = False
     else:
-        validated = validate_transaction_schema(real_df)
-        data, _scaler, info = transform_to_PyG(
-            validated,
-            lap_pe_dim=int(data_cfg.get("lap_pe_dim", 8)),
-            rw_pe_dim=int(data_cfg.get("rw_pe_dim", 8)),
-            velocity_window_seconds=float(data_cfg.get("velocity_window_seconds", 86400)),
-        )
-        stats = {**info, **fetch_info, "real_data": True}
+        from src.pipeline.discovery.auto_fetch import sanitize_transactions
+
+        # Sanitize the raw table and fall back to synthetic if every row is
+        # dropped (real source discovered but not AML-shaped).
+        sanitized = sanitize_transactions(real_df)
+        if sanitized.empty:
+            from src.pipeline.discovery.auto_fetch import fetch_to_pyg
+
+            data, stats = fetch_to_pyg(hf_query=None, source=None)
+            stats["fetch_info"] = {**fetch_info, "reason": "real_source_empty_after_sanitation"}
+            stats["real_data"] = False
+        else:
+            validated = validate_transaction_schema(sanitized)
+            data, _scaler, info = transform_to_PyG(
+                validated,
+                lap_pe_dim=int(data_cfg.get("lap_pe_dim", 8)),
+                rw_pe_dim=int(data_cfg.get("rw_pe_dim", 8)),
+                velocity_window_seconds=float(data_cfg.get("velocity_window_seconds", 86400)),
+            )
+            stats = {**info, **fetch_info, "real_data": True}
     if not hasattr(data, "x") or not hasattr(data, "edge_index"):
         raise RuntimeError("fetch_to_pyg returned a graph without x/edge_index tensors")
     if data.x.dim() != 2:

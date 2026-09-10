@@ -279,6 +279,101 @@ def search_huggingface_split(
     return merged[:limit]
 
 
+def search_huggingface_fulltext(
+    query: str, *, limit: int = 8, timeout: float = 15.0
+) -> list[DatasetCandidate]:
+    """Broad full-text backup search over the Hub REST API (no client needed).
+
+    The ``huggingface_hub`` filtered ``list_datasets(search=...)`` endpoint can
+    return zero rows for compound/over-specific queries.  This backup hits the
+    public ``/api/datasets`` full-text search directly (matches names,
+    descriptions and cards), so short keywords like ``aml`` still surface
+    candidates when the typed client query has zero recall.  Best-effort:
+    any failure returns ``[]``.
+    """
+    keywords = [k for k in split_compound_query(query) if len(k) >= 2]
+    if not keywords:
+        return []
+    # Fan out each short keyword against full-text search, merge + dedupe.
+    merged: list[DatasetCandidate] = []
+    seen: set[str] = set()
+    for keyword in keywords[:6]:
+        try:
+            response = requests.get(
+                "https://huggingface.co/api/datasets",
+                params={"search": keyword, "limit": min(limit, 50)},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            rows = response.json()
+        except Exception as exc:  # noqa: BLE001 - discovery is best-effort
+            logger.warning(
+                "huggingface_fulltext_failed", extra={"query": keyword, "error": str(exc)}
+            )
+            continue
+        if isinstance(rows, dict):
+            rows = rows.get("datasets", rows.get("data", []))
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            repo = str(row.get("id", "") or "")
+            if not repo or f"huggingface:{repo}" in seen:
+                continue
+            seen.add(f"huggingface:{repo}")
+            merged.append(
+                DatasetCandidate(
+                    id=f"huggingface:{repo}",
+                    provider="huggingface",
+                    title=str(row.get("id", "")),
+                    url=f"https://huggingface.co/datasets/{repo}",
+                    download_url=None,
+                    metadata={
+                        "likes": row.get("likes", 0),
+                        "downloads": row.get("downloads", 0),
+                        "tags": row.get("tags", []),
+                        "fulltext_query": keyword,
+                    },
+                )
+            )
+            if len(merged) >= limit:
+                break
+        if len(merged) >= limit:
+            break
+    return merged[:limit]
+
+
+def kaggle_diagnose() -> dict[str, Any]:
+    """Diagnose Kaggle availability: credentials vs call-logic failure.
+
+    Returns ``{"available", "reason", "username_set", "key_set",
+    "client_importable"}``.  ``available`` is True only when credentials exist
+    *and* the ``kaggle`` client imports.  The discovery loop calls this once
+    and — when unavailable for *either* reason — automatically skips Kaggle
+    and relies on Hugging Face / GitHub / web instead of stopping or failing.
+    """
+    username_set = bool(os.environ.get("KAGGLE_USERNAME"))
+    key_set = bool(os.environ.get("KAGGLE_KEY"))
+    try:
+        from kaggle.api.kaggle_api_extended import KaggleApi  # noqa: F401
+
+        client_importable = True
+    except Exception:  # noqa: BLE001 - any import problem means unavailable
+        client_importable = False
+    if not (username_set and key_set):
+        reason = "missing credentials: set KAGGLE_USERNAME and KAGGLE_KEY (see README)"
+    elif not client_importable:
+        reason = "kaggle client not importable: pip install kaggle"
+    else:
+        reason = "ok"
+    return {
+        "available": bool(username_set and key_set and client_importable),
+        "reason": reason,
+        "username_set": username_set,
+        "key_set": key_set,
+        "client_importable": client_importable,
+    }
+
+
 def kaggle_credentials_available() -> bool:
     """Return True when Kaggle credentials are configured (alias)."""
     return _has_kaggle_credentials()
@@ -557,12 +652,25 @@ def search_web_resilient(
 
 
 def _huggingface_plugin(query: str, *, limit: int = 8, timeout: float = 15.0) -> list[DatasetCandidate]:
-    """Hugging Face plugin entry: always fan out short single-keyword queries."""
-    return search_huggingface_split(query, limit=limit, timeout=timeout)
+    """Hugging Face plugin entry: split fan-out + full-text backup on zero recall."""
+    results = search_huggingface_split(query, limit=limit, timeout=timeout)
+    if not results:
+        # Automatic backup: broad full-text search over names/descriptions/cards.
+        results = search_huggingface_fulltext(query, limit=limit, timeout=timeout)
+    return results
 
 
 def _kaggle_plugin(query: str, *, limit: int = 8, timeout: float = 15.0) -> list[DatasetCandidate]:
-    """Kaggle plugin entry with automatic public-HF fallback when unauthenticated."""
+    """Kaggle plugin entry with automatic public-HF fallback when unavailable.
+
+    Uses :func:`kaggle_diagnose` (credentials *and* client import).  When
+    Kaggle is unavailable for either reason the system automatically skips it
+    and falls back to public Hugging Face instead of stopping or failing.
+    """
+    diagnosis = kaggle_diagnose()
+    if diagnosis["available"]:
+        return search_kaggle(query, limit=limit, timeout=timeout)
+    logger.warning("kaggle_skipped", extra={"reason": diagnosis["reason"], "query": query})
     candidates, _provider = search_kaggle_with_fallback(query, limit=limit, timeout=timeout)
     return candidates
 
@@ -994,10 +1102,10 @@ def select_source(
             continue
         if score is None:
             continue
-        # Normalise 0..1-ish validation scores onto the 0-100 quality scale.
-        norm = score * 100.0 if 0.0 <= score <= 1.5 else score
-        if norm >= min_quality and norm > best_score:
-            best_score = norm
+        # Scores are on the 0-100 quality scale (from score_data_source_quality
+        # / assess_reliability).  Only pick sources at/above the quality floor.
+        if score >= min_quality and score > best_score:
+            best_score = score
             best = source
     return best
 
@@ -1062,7 +1170,13 @@ def download_dataset(
 
     Supports ``http(s)://``, ``file://`` and plain local paths. Returns ``None``
     when the candidate has no ``download_url``.
+
+    Hugging Face datasets are fetched via the ``datasets`` library and written
+    as a local CSV so the rest of the pipeline (sanitation, validation, PyG
+    construction) works identically for every provider.
     """
+    if candidate.provider == "huggingface":
+        return _download_hf_dataset(candidate, download_dir, timeout=timeout)
     url = candidate.download_url
     if not url:
         logger.warning("no_download_url", extra={"id": candidate.id})
@@ -1094,6 +1208,41 @@ def download_dataset(
         return path if path.exists() else None
 
     raise RuntimeError(f"Unsupported download scheme for {candidate.id}: {url!r}")
+
+
+def _download_hf_dataset(
+    candidate: DatasetCandidate,
+    download_dir: Path | str,
+    *,
+    timeout: float = 30.0,
+) -> Path | None:
+    """Download a Hugging Face dataset via the ``datasets`` library → local CSV.
+
+    The candidate id is expected to be ``huggingface:owner/repo``; the repo
+    part is loaded with ``datasets.load_dataset`` and written as a CSV into
+    ``download_dir`` so the rest of the pipeline works identically.
+    """
+    repo = candidate.id.split(":", 1)[-1] if ":" in candidate.id else candidate.id
+    if not repo:
+        logger.warning("hf_download_missing_repo", extra={"id": candidate.id})
+        return None
+    dest_dir = Path(download_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    destination = dest_dir / f"{_safe_filename(repo)}.csv"
+    try:
+        from datasets import load_dataset
+
+        ds = load_dataset(repo, split="train", streaming=False)
+        df = ds.to_pandas()
+        df.to_csv(destination, index=False)
+        logger.info(
+            "hf_dataset_downloaded",
+            extra={"repo": repo, "rows": len(df), "path": str(destination)},
+        )
+        return destination
+    except Exception as exc:  # noqa: BLE001 - best-effort; pipeline falls back to synthetic
+        logger.warning("hf_download_failed", extra={"repo": repo, "error": str(exc)})
+        return None
 
 
 def _browser_download_dataset(
@@ -1249,6 +1398,152 @@ def verify_candidates(
         extra={"attempted": min(len(ranked), top_k), "verified": len(verified)},
     )
     return verified
+
+
+# ---------------------------------------------------------------------------
+# Fully automated discovery orchestrator (no human intervention)
+# ---------------------------------------------------------------------------
+
+
+def _audit_selection_log() -> list[dict[str, Any]]:
+    """Fresh per-run audit trail for the automatic select loop."""
+    return []
+
+
+def auto_discover_source(
+    *,
+    assets: Iterable[str] | None = None,
+    aml_terms: Iterable[str] | None = None,
+    formats: Iterable[str] | None = None,
+    providers: str | Iterable[str] = "all",
+    max_queries: int = 24,
+    per_provider_limit: int = 8,
+    download_dir: Path | str = "data/discovery",
+    top_k: int = 5,
+    timeout: float = 30.0,
+    min_quality: float = MIN_QUALITY_SCORE,
+    allow_synthetic: bool = True,
+) -> dict[str, Any]:
+    """Fetch → score → select loop, fully automatic (zero human intervention)."""
+    decision_log = _audit_selection_log()
+    candidates = discover_candidates(
+        assets=assets or DEFAULT_CRYPTO_ASSETS,
+        aml_terms=aml_terms or DEFAULT_AML_TERMS,
+        formats=formats or DEFAULT_FORMATS,
+        providers=providers,
+        max_queries=max_queries,
+        per_provider_limit=per_provider_limit,
+    )
+    decision_log.append({"event": "search_complete", "n_candidates": len(candidates)})
+    if not candidates:
+        decision_log.append({"event": "no_candidates", "action": "synthetic_fallback"})
+        if not allow_synthetic:
+            return {"status": "empty", "scored": [], "decision_log": decision_log}
+        out: dict[str, Any] = {
+            "status": "synthetic",
+            "df": generate_synthetic_transactions(),
+            "reason": "no candidates discovered",
+            "scored": [],
+            "decision_log": decision_log,
+        }
+        return out
+    verified = verify_candidates(
+        candidates, download_dir, top_k=top_k, timeout=timeout, strict=False
+    )
+    decision_log.append({"event": "verify_complete", "n_verified": len(verified)})
+    if not verified:
+        decision_log.append({"event": "no_downloadable", "action": "synthetic_fallback"})
+        if not allow_synthetic:
+            return {"status": "empty", "scored": [], "decision_log": decision_log}
+        out = {
+            "status": "synthetic",
+            "df": generate_synthetic_transactions(),
+            "reason": "no candidate downloadable",
+            "scored": [],
+            "decision_log": decision_log,
+        }
+        return out
+    scored: list[tuple[DatasetCandidate, float]] = []
+    scored_audit: list[dict[str, Any]] = []
+    for item in verified:
+        frame = item.raw_df if item.raw_df is not None else pd.DataFrame()
+        gate = score_data_source_quality(frame)
+        scored.append((item.candidate, float(gate["quality_score"])))
+        scored_audit.append(
+            {
+                "id": item.candidate.id,
+                "provider": item.candidate.provider,
+                "quality_score": float(gate["quality_score"]),
+                "verified": bool(gate["verified"]),
+                "reasons": list(gate.get("reasons", [])),
+            }
+        )
+        decision_log.append(
+            {
+                "event": "candidate_scored",
+                "id": item.candidate.id,
+                "quality_score": float(gate["quality_score"]),
+            }
+        )
+    best = select_source(scored, min_quality=min_quality)
+    by_id = {item.candidate.id: item for item in verified}
+    best_id = best.id if isinstance(best, DatasetCandidate) else best
+    if best is not None and best_id in by_id:
+        chosen = by_id[best_id]
+        entry = next(a for a in scored_audit if a["id"] == best_id)
+        decision_log.append(
+            {"event": "source_selected", "id": best_id, "quality_score": entry["quality_score"]}
+        )
+        logger.info(
+            "source_selected",
+            extra={
+                "id": best_id,
+                "quality_score": entry["quality_score"],
+                "reasons": entry["reasons"],
+            },
+        )
+        return {
+            "status": "selected",
+            "candidate": chosen.candidate,
+            "assessment": chosen.assessment,
+            "raw_df": chosen.raw_df,
+            "scored": scored_audit,
+            "decision_log": decision_log,
+        }
+    ranked = sorted(scored_audit, key=lambda a: a["quality_score"], reverse=True)
+    if ranked:
+        fallback_entry = ranked[0]
+        fallback_item = by_id[fallback_entry["id"]]
+        decision_log.append(
+            {
+                "event": "below_threshold_fallback_real",
+                "id": fallback_entry["id"],
+                "quality_score": fallback_entry["quality_score"],
+                "threshold": min_quality,
+            }
+        )
+        logger.info(
+            "source_fallback_real",
+            extra={"id": fallback_entry["id"], "quality_score": fallback_entry["quality_score"]},
+        )
+        return {
+            "status": "fallback_real",
+            "candidate": fallback_item.candidate,
+            "assessment": fallback_item.assessment,
+            "raw_df": fallback_item.raw_df,
+            "scored": scored_audit,
+            "decision_log": decision_log,
+        }
+    decision_log.append({"event": "all_failed", "action": "synthetic_fallback"})
+    if not allow_synthetic:
+        return {"status": "empty", "scored": scored_audit, "decision_log": decision_log}
+    return {
+        "status": "synthetic",
+        "df": generate_synthetic_transactions(),
+        "reason": "all candidates failed verification",
+        "scored": scored_audit,
+        "decision_log": decision_log,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1586,9 +1881,37 @@ def list_candidate_datasets(
         from huggingface_hub import HfApi
 
         api = HfApi()
-        query = " ".join(keywords + tags)
-        rows = api.list_datasets(search=query, author=author, limit=limit)
-        datasets = [row.id for row in rows]
+        # Compound multi-word queries zero-recall on the Hub: fan out SHORT
+        # single-keyword queries (AML, fraud, elliptic, ...) and merge.
+        short_queries: list[str] = []
+        for keyword in keywords:
+            short_queries.extend(split_compound_query(keyword))
+        short_queries.extend(split_compound_query(" ".join(tags)))
+        short_queries = [q for q in dict.fromkeys(short_queries) if len(q) >= 2][:8]
+        datasets = []
+        seen_ids: set[str] = set()
+        for query in short_queries or ["aml"]:
+            try:
+                rows = api.list_datasets(search=query, author=author, limit=limit)
+            except Exception as exc:  # noqa: BLE001 - one bad keyword skips
+                logger.warning("hf_keyword_search_failed", extra={"query": query})
+                logger.debug("hf_keyword_search_error", extra={"error": str(exc)})
+                continue
+            for row in rows:
+                if row.id not in seen_ids:
+                    seen_ids.add(row.id)
+                    datasets.append(row.id)
+                if len(datasets) >= limit:
+                    break
+            if len(datasets) >= limit:
+                break
+        if not datasets:
+            # Automatic backup: broad full-text REST search (no client filter).
+            for cand in search_huggingface_fulltext(" ".join(keywords), limit=limit):
+                repo = cand.id.split(":", 1)[-1]
+                if repo not in seen_ids:
+                    seen_ids.add(repo)
+                    datasets.append(repo)
     except Exception as exc:  # network, auth, or hub rate-limit
         logger.warning("hf_dataset_discovery_failed", extra={"error": str(exc)})
         datasets = []
@@ -1607,15 +1930,15 @@ def list_candidate_datasets(
 
 
 def _canonicalise(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename columns to the canonical schema, best-effort."""
-    from src.pipeline.discovery.ingestion import _COLUMN_ALIASES
+    """Rename columns to the canonical schema, best-effort (fuzzy included)."""
+    from src.pipeline.discovery.ingestion import fuzzy_map_columns
 
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
-    lower_map = {c.lower(): c for c in df.columns}
-    for alias, canonical in _COLUMN_ALIASES.items():
-        if alias.lower() in lower_map:
-            df = df.rename(columns={lower_map[alias.lower()]: canonical})
+    fuzzy = fuzzy_map_columns([str(c) for c in df.columns])
+    rename = {raw: canonical for raw, (canonical, _conf) in fuzzy.items() if raw in df.columns}
+    if rename:
+        df = df.rename(columns=rename)
     return df
 
 
@@ -1725,12 +2048,49 @@ def _spec_kind(spec: str) -> str:
 
 
 def _load_candidate(spec: str, synthetic_sources: dict[str, dict[str, Any]] | None) -> pd.DataFrame:
-    """Load a single candidate source: HF repo, local path, or synthetic."""
+    """Load a single candidate source: HF repo, local path, or synthetic.
+
+    Hugging Face dataset ids (``owner/repo``) are fetched via the ``datasets``
+    library (best-effort); local paths / URLs go through ``fetch_transactions``.
+    """
     if _spec_kind(spec) == "synthetic":
         name = spec.split(":", 1)[1] if ":" in spec else "default"
         kwargs = (synthetic_sources or {}).get(name, {})
         return generate_synthetic_transactions(**kwargs)
+    if _spec_kind(spec) == "hf":
+        return _load_hf_dataset(spec)
     return fetch_transactions(source=spec, fallback_generate=False)
+
+
+def _load_hf_dataset(repo_id: str) -> pd.DataFrame:
+    """Load a Hugging Face dataset repo into a pandas DataFrame.
+
+    Tries the ``datasets`` library first (no auth needed for public repos).
+    Falls back to ``fetch_transactions`` (handles mocked / test sources and
+    non-HF dataset references) and ultimately raises ``RuntimeError`` so the
+    discovery loop skips the broken dataset.
+    """
+    try:
+        from datasets import load_dataset
+
+        try:
+            ds = load_dataset(repo_id, split="train", streaming=False)
+            df = ds.to_pandas()
+            if df.empty:
+                raise ValueError("empty table")
+            logger.info(
+                "hf_dataset_loaded",
+                extra={"repo": repo_id, "rows": len(df), "columns": list(df.columns)},
+            )
+            return df
+        except Exception as hf_exc:  # noqa: BLE001 - try fallback
+            logger.info(
+                "hf_dataset_load_fallback",
+                extra={"repo": repo_id, "error": str(hf_exc)},
+            )
+    except ImportError:
+        pass  # datasets library not installed; use fallback
+    return fetch_transactions(source=repo_id, fallback_generate=False)
 
 
 def auto_fetch(
