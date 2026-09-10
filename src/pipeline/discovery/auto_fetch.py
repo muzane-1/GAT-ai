@@ -230,6 +230,84 @@ def _request_json(url: str, *, params: dict[str, Any] | None = None, timeout: fl
     return response.json()
 
 
+def _has_kaggle_credentials() -> bool:
+    """Return True when Kaggle API credentials are present in the environment."""
+    return bool(os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY"))
+
+
+def split_compound_query(query: str) -> list[str]:
+    """Split a compound search query into short single-keyword queries.
+
+    Hugging Face (and several other provider) search endpoints score exact
+    multi-word queries poorly.  Splitting e.g. ``"bitcoin money laundering"``
+    into ``["bitcoin", "money", "laundering"]`` gives far better recall; the
+    caller fans each keyword out independently and de-duplicates results.
+    """
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for token in re.split(r"[\s,;+]+", str(query).strip().lower()):
+        token = token.strip()
+        if token and token not in seen:
+            seen.add(token)
+            keywords.append(token)
+    return keywords
+
+
+def search_huggingface_split(
+    query: str, *, limit: int = 8, timeout: float = 15.0
+) -> list[DatasetCandidate]:
+    """Search Hugging Face with short single-keyword queries.
+
+    Compound queries are split via :func:`split_compound_query` and each
+    keyword is searched independently; results are merged and de-duplicated
+    (preserving first-seen order) up to ``limit`` entries.
+    """
+    keywords = split_compound_query(query)
+    if not keywords:
+        return []
+    merged: list[DatasetCandidate] = []
+    seen: set[str] = set()
+    for keyword in keywords:
+        for candidate in search_huggingface(keyword, limit=limit, timeout=timeout):
+            if candidate.id not in seen:
+                seen.add(candidate.id)
+                merged.append(candidate)
+            if len(merged) >= limit:
+                break
+        if len(merged) >= limit:
+            break
+    return merged[:limit]
+
+
+def kaggle_credentials_available() -> bool:
+    """Return True when Kaggle credentials are configured (alias)."""
+    return _has_kaggle_credentials()
+
+
+def search_kaggle_with_fallback(
+    query: str, *, limit: int = 8, timeout: float = 15.0
+) -> tuple[list[DatasetCandidate], str]:
+    """Search Kaggle, falling back to public Hugging Face AML datasets.
+
+    Returns ``(candidates, provider_used)`` where ``provider_used`` is
+    ``"kaggle"`` when authenticated search ran, otherwise ``"huggingface"``.
+    """
+    if _has_kaggle_credentials():
+        return search_kaggle(query, limit=limit, timeout=timeout), "kaggle"
+    logger.warning(
+        "kaggle_credentials_missing_fallback_hf",
+        extra={"query": query, "reason": "KAGGLE_USERNAME/KAGGLE_KEY missing"},
+    )
+    keywords = split_compound_query(query)
+    fallback_query = " ".join(keywords[:2]) if keywords else "aml"
+    return search_huggingface_split(fallback_query, limit=limit, timeout=timeout), "huggingface"
+
+
+def has_kaggle_credentials() -> bool:
+    """Public alias for the Kaggle credential check."""
+    return _has_kaggle_credentials()
+
+
 def search_huggingface(
     query: str, *, limit: int = 8, timeout: float = 15.0
 ) -> list[DatasetCandidate]:
@@ -304,8 +382,9 @@ def _as_int(value: Any) -> int | None:
         return None
 
 
-def search_kaggle(query: str, *, limit: int = 8) -> list[DatasetCandidate]:
+def search_kaggle(query: str, *, limit: int = 8, timeout: float = 15.0) -> list[DatasetCandidate]:
     """Search Kaggle datasets via the official client (requires credentials)."""
+    del timeout  # Kaggle client manages its own HTTP timeouts.
     if not (os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY")):
         logger.warning("kaggle_search_skipped", extra={"reason": "credentials missing"})
         return []
@@ -477,10 +556,21 @@ def search_web_resilient(
     return search_web_browser(query, limit=limit)
 
 
+def _huggingface_plugin(query: str, *, limit: int = 8, timeout: float = 15.0) -> list[DatasetCandidate]:
+    """Hugging Face plugin entry: always fan out short single-keyword queries."""
+    return search_huggingface_split(query, limit=limit, timeout=timeout)
+
+
+def _kaggle_plugin(query: str, *, limit: int = 8, timeout: float = 15.0) -> list[DatasetCandidate]:
+    """Kaggle plugin entry with automatic public-HF fallback when unauthenticated."""
+    candidates, _provider = search_kaggle_with_fallback(query, limit=limit, timeout=timeout)
+    return candidates
+
+
 _PLUGINS: tuple[tuple[str, Callable[..., list[DatasetCandidate]]], ...] = (
-    ("huggingface", search_huggingface),
+    ("huggingface", _huggingface_plugin),
     ("github", search_github),
-    ("kaggle", search_kaggle),
+    ("kaggle", _kaggle_plugin),
     ("web", search_web_resilient),
 )
 _PROVIDERS.update(_PLUGINS)
@@ -612,7 +702,18 @@ def discover_candidates(
     collected: dict[str, list[DatasetCandidate]] = {p: [] for p in providers_l}
     for provider in providers_l:
         fn = _PROVIDERS[provider]
-        for query in queries:
+        # Hugging Face compound queries ("bitcoin money laundering csv") score
+        # poorly on the Hub; fan out short single-keyword queries instead
+        # (e.g. AML, transactions, elliptic) for far better recall.
+        provider_queries: list[str] = []
+        if provider == "huggingface":
+            for query in queries:
+                provider_queries.extend(split_compound_query(query))
+            # De-duplicate keywords, preserve order, keep the fan-out bounded.
+            provider_queries = list(dict.fromkeys(provider_queries))[: max_queries * 3]
+        else:
+            provider_queries = list(queries)
+        for query in provider_queries:
             if len(collected[provider]) >= per_provider_limit:
                 break
             seen_ids = {c.id for c in collected[provider]}
@@ -793,6 +894,112 @@ def assess_reliability(
         reasons=tuple(reasons),
         metadata=metadata,
     )
+
+
+def score_data_source_quality(dataset: pd.DataFrame | DatasetCandidate) -> dict[str, Any]:
+    """Score a data source's quality (0-100 scale, automated quality gate).
+
+    Accepts either a raw transaction table (scored via
+    :func:`src.pipeline.validation.scoring.evaluate_candidate_dataset` and
+    rescaled to 0-100) or a :class:`DatasetCandidate` (scored via
+    :func:`assess_reliability` metadata gates).  Returns a stable dict with
+    ``quality_score``, ``verified``, ``has_explicit_label``,
+    ``has_edge_connections`` and ``details`` so the pipeline can rank, filter
+    and select sources with zero human-in-the-loop interaction.
+    """
+    if isinstance(dataset, DatasetCandidate):
+        assessment = assess_reliability(dataset)
+        return {
+            "quality_score": float(assessment.quality_score),
+            "verified": bool(assessment.verified),
+            "has_explicit_label": bool(assessment.has_explicit_label),
+            "has_edge_connections": bool(assessment.has_edge_connections),
+            "reasons": list(assessment.reasons),
+            "details": {
+                "schema_fit": assessment.schema_fit,
+                "data_health": assessment.data_health,
+                "graph_topology": assessment.graph_topology,
+            },
+        }
+    from src.pipeline.validation.scoring import evaluate_candidate_dataset
+
+    report = evaluate_candidate_dataset(dataset)
+    quality = float(report.get("weighted_score", 0.0))
+    # Validation scoring returns a 0..~1-ish weighted score; rescale to 0-100.
+    quality_100 = quality * 100.0 if quality <= 1.5 else quality
+    quality_100 = round(min(max(quality_100, 0.0), 100.0), 2)
+    label_ok = bool(_df_has_explicit_label(dataset))
+    edge_ok = bool(_df_has_edge_connections(dataset))
+    # A table with a degenerate label distribution (all-benign / all-flagged)
+    # carries no discriminative signal: hard-cap it below the quality floor so
+    # it can never win automated selection (mirrors assess_reliability gates).
+    aml_ratio = float(report.get("aml_ratio", 0.0))
+    if label_ok and edge_ok and not (0.0 < aml_ratio < 0.5):
+        quality_100 = min(quality_100, MIN_QUALITY_SCORE - 1.0)
+    verified = bool(
+        label_ok and edge_ok and 0.0 < aml_ratio < 0.5 and quality_100 >= MIN_QUALITY_SCORE
+    )
+    return {
+        "quality_score": quality_100,
+        "verified": verified,
+        "has_explicit_label": label_ok,
+        "has_edge_connections": edge_ok,
+        "reasons": [] if verified else ["automated quality gate below threshold"],
+        "details": report,
+    }
+
+
+def select_source(
+    scored_sources: Sequence[tuple[Any, float] | dict[str, Any]],
+    *,
+    min_quality: float = MIN_QUALITY_SCORE,
+) -> Any | None:
+    """Automatically select the best real data source (no manual intervention).
+
+    Accepts a ranked/filterable collection in any of the supported shapes:
+
+    * ``[(candidate_or_id, score), ...]`` tuples,
+    * ``[{"source"/"candidate"/"id": ..., "quality_score"/"score": ...}]`` dicts,
+    * ``[(DatasetCandidate, DatasetAssessment), ...]`` rank pairs.
+
+    Returns the highest-scoring entry at/above ``min_quality``, else ``None``.
+    """
+    best: Any = None
+    best_score = float("-inf")
+    for entry in scored_sources:
+        source: Any = None
+        score: float | None = None
+        if isinstance(entry, dict):
+            source = entry.get("source", entry.get("candidate", entry.get("id")))
+            for key in ("quality_score", "score", "weighted_score"):
+                if entry.get(key) is not None:
+                    try:
+                        score = float(entry[key])  # type: ignore[index]
+                    except (TypeError, ValueError):
+                        score = None
+                    break
+        elif isinstance(entry, (tuple, list)) and len(entry) == 2:
+            first, second = entry[0], entry[1]
+            if isinstance(second, DatasetAssessment):
+                source, score = first, float(second.quality_score)
+            elif isinstance(first, DatasetCandidate) and isinstance(second, (int, float)):
+                source, score = first, float(second)
+            else:
+                try:
+                    score = float(second)  # type: ignore[arg-type]
+                    source = first
+                except (TypeError, ValueError):
+                    continue
+        else:
+            continue
+        if score is None:
+            continue
+        # Normalise 0..1-ish validation scores onto the 0-100 quality scale.
+        norm = score * 100.0 if 0.0 <= score <= 1.5 else score
+        if norm >= min_quality and norm > best_score:
+            best_score = norm
+            best = source
+    return best
 
 
 def rank_candidates(
@@ -1176,6 +1383,52 @@ def handoff_to_features(
     return features, info
 
 
+def transform_to_PyG(
+    df: pd.DataFrame,
+    *,
+    validate: bool = True,
+    lap_pe_dim: int = 8,
+    rw_pe_dim: int = 8,
+    velocity_window_seconds: float = 86_400.0,
+    **builder_kwargs: Any,
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Transform a validated real transaction table into a PyG graph object.
+
+    Pipeline: Pandera schema validation (``src``/``dst``/``amount``/
+    ``timestamp``/``is_laundering``) → :func:`build_pyg_data` (positional
+    encodings + degree features via the feature kernel) → stats dict.
+
+    Returns ``(data, scaler, info)`` with node/edge/feature counts.
+    """
+    from src.pipeline.transform.graph_builder import build_pyg_data
+    from src.pipeline.validation.pandera_schema import validate_transaction_schema
+
+    frame = validate_transaction_schema(df) if validate else df
+    data, scaler = build_pyg_data(
+        frame,
+        velocity_window_seconds=velocity_window_seconds,
+        lap_pe_dim=lap_pe_dim,
+        rw_pe_dim=rw_pe_dim,
+        **builder_kwargs,
+    )
+    info: dict[str, Any] = {
+        "num_nodes": int(data.num_nodes),
+        "num_edges": int(data.num_edges),
+        "num_node_features": int(data.num_node_features),
+        "edge_features": int(data.edge_attr.shape[1]) if data.edge_attr is not None else 0,
+        "has_lap_pe": getattr(data, "lap_pe", None) is not None,
+        "has_rw_pe": getattr(data, "rw_pe", None) is not None,
+    }
+    return data, scaler, info
+
+
+def transform_to_pyg(  # noqa: N802 - camelCase alias required by pipeline spec
+    df: pd.DataFrame, **kwargs: Any
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Snake-case alias of :func:`transform_to_PyG`."""
+    return transform_to_PyG(df, **kwargs)
+
+
 def handoff_to_graph_builder(
     df: pd.DataFrame,
     **builder_kwargs: Any,
@@ -1528,7 +1781,9 @@ def auto_fetch(
             df = None
 
     if df is None:
-        # Dynamic discovery of Hugging Face datasets
+        # Dynamic discovery of Hugging Face datasets.
+        # Automated quality gate: rank, filter and select the best real source
+        # with zero human-in-the-loop via score/select helpers below.
         candidate_datasets = list_candidate_datasets(
             keywords=hf_keywords or DEFAULT_KEYWORDS,
             tags=hf_tags or DEFAULT_TAGS,
@@ -1542,16 +1797,23 @@ def auto_fetch(
         if candidate_datasets:
             logger.info(f"Discovered {len(candidate_datasets)} candidate datasets")
 
-            # Evaluate and rank candidate datasets
+            # Evaluate and rank candidate datasets via the automated gate.
             evaluated_datasets = []
+            scored_for_selection: list[tuple[str, float]] = []
+            raw_by_id: dict[str, pd.DataFrame] = {}
             for dataset_id in candidate_datasets:
                 try:
                     df_raw = _load_candidate(dataset_id, synthetic_sources)
                     evaluation_scores = evaluate_candidate_dataset(df_raw)
                     evaluated_datasets.append((dataset_id, evaluation_scores, df_raw))
+                    raw_by_id[dataset_id] = df_raw
+                    # Automated scoring on the 0-100 quality scale.
+                    gate = score_data_source_quality(df_raw)
+                    scored_for_selection.append((dataset_id, float(gate["quality_score"])))
                     logger.info(
                         f"Evaluated dataset {dataset_id}: "
-                        f"score={evaluation_scores['weighted_score']:.3f}"
+                        f"score={evaluation_scores['weighted_score']:.3f} "
+                        f"quality={gate['quality_score']:.1f}"
                     )
                 except Exception as exc:
                     logger.warning(
@@ -1561,11 +1823,24 @@ def auto_fetch(
                     continue
 
             if evaluated_datasets:
-                # Sort by weighted score in descending order
+                # Sort by weighted score in descending order (audit trail).
                 evaluated_datasets.sort(key=lambda x: x[1]["weighted_score"], reverse=True)
 
+                # Automated selection: highest quality source at/above the floor.
+                auto_selected = select_source(scored_for_selection)
+                ordered_ids: list[str] = []
+                if auto_selected is not None:
+                    ordered_ids.append(auto_selected)
+                ordered_ids.extend(
+                    ds_id for ds_id, _, _ in evaluated_datasets if ds_id not in ordered_ids
+                )
+
                 # Select the highest-scoring dataset that passes hard validation checks
-                for dataset_id, evaluation_scores, df_raw in evaluated_datasets:
+                for dataset_id in ordered_ids:
+                    evaluation_scores = next(
+                        s for d, s, _ in evaluated_datasets if d == dataset_id
+                    )
+                    df_raw = raw_by_id[dataset_id]
                     try:
                         df = sanitize_transactions(df_raw)
                         stats = validate_transactions(df)

@@ -193,6 +193,145 @@ def test_search_kaggle_requires_credentials(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.delenv("KAGGLE_USERNAME", raising=False)
     monkeypatch.delenv("KAGGLE_KEY", raising=False)
     assert AUTO_FETCH.search_kaggle("bitcoin laundering") == []
+    # Automated fallback: missing creds -> public Hugging Face AML datasets.
+    sentinel = [
+        AUTO_FETCH.DatasetCandidate(id="huggingface:a/b", provider="huggingface", title="t", url="u")
+    ]
+    monkeypatch.setattr(
+        AUTO_FETCH, "search_huggingface_split", lambda query, **kwargs: sentinel
+    )
+    candidates, provider = AUTO_FETCH.search_kaggle_with_fallback("bitcoin laundering")
+    assert provider == "huggingface"
+    assert candidates == sentinel
+    assert AUTO_FETCH.has_kaggle_credentials() is False
+
+
+def test_split_compound_query_single_keywords() -> None:
+    """Compound HF queries split into short single-keyword queries."""
+    assert AUTO_FETCH.split_compound_query("bitcoin money laundering csv") == [
+        "bitcoin",
+        "money",
+        "laundering",
+        "csv",
+    ]
+    assert AUTO_FETCH.split_compound_query("AML, transactions; elliptic") == [
+        "aml",
+        "transactions",
+        "elliptic",
+    ]
+    assert AUTO_FETCH.split_compound_query("  ") == []
+
+
+def test_search_huggingface_split_fans_out_keywords(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Split search fans each keyword out and de-duplicates merged results."""
+    calls: list[str] = []
+
+    def _fake_search(query: str, *, limit: int = 8, timeout: float = 15.0):
+        calls.append(query)
+        return [
+            AUTO_FETCH.DatasetCandidate(
+                id=f"huggingface:{query}/ds", provider="huggingface", title=query, url="x"
+            )
+        ]
+
+    monkeypatch.setattr(AUTO_FETCH, "search_huggingface", _fake_search)
+    results = AUTO_FETCH.search_huggingface_split("AML transactions", limit=8)
+    assert calls == ["aml", "transactions"]
+    assert [c.id for c in results] == ["huggingface:aml/ds", "huggingface:transactions/ds"]
+
+
+def test_score_data_source_quality_and_select_source() -> None:
+    """Automated gate ranks/filters/selects the best real source (no HITL)."""
+    import pandas as pd
+
+    good = pd.DataFrame(
+        {
+            "tx_id": [0, 1, 2],
+            "src": ["A", "B", "C"],
+            "dst": ["B", "C", "A"],
+            "amount": [10.5, 22.0, 700.0],
+            "timestamp": [1000.0, 1001.0, 1002.0],
+            "is_laundering": [0, 1, 0],
+        }
+    )
+    bad = good.copy()
+    bad["is_laundering"] = 0
+    good_gate = AUTO_FETCH.score_data_source_quality(good)
+    bad_gate = AUTO_FETCH.score_data_source_quality(bad)
+    assert good_gate["verified"] is True
+    selected = AUTO_FETCH.select_source(
+        [("bad", bad_gate["quality_score"]), ("good", good_gate["quality_score"])]
+    )
+    assert selected == "good"
+    assert AUTO_FETCH.select_source([("bad", 1.0)]) is None
+    cand = AUTO_FETCH.DatasetCandidate(
+        id="test:1",
+        provider="test",
+        title="t",
+        url="u",
+        metadata={"columns": ["tx_id", "label", "source", "target"]},
+    )
+    cand_gate = AUTO_FETCH.score_data_source_quality(cand)
+    assert "quality_score" in cand_gate and "verified" in cand_gate
+
+
+def test_transform_to_PyG_validates_and_builds_graph() -> None:
+    """Real tables validate (Pandera) and become PyG graphs with PE + degrees."""
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {
+            "tx_id": [0, 1, 2],
+            "src": ["A", "B", "C"],
+            "dst": ["B", "C", "A"],
+            "amount": [10.5, 22.0, 700.0],
+            "timestamp": [1000.0, 1001.0, 1002.0],
+            "is_laundering": [0, 1, 0],
+        }
+    )
+    data, _scaler, info = AUTO_FETCH.transform_to_PyG(frame)
+    assert data.num_nodes == 3 and data.num_edges == 3
+    assert data.x.shape[1] == 9  # FEATURE_COLUMNS incl. degree features
+    assert getattr(data, "lap_pe") is not None and getattr(data, "rw_pe") is not None
+    assert info["num_nodes"] == 3
+
+
+def test_gnn_train_step_and_model_factory() -> None:
+    """GNN factory builds GATv2/GraphSAGE; train step runs fwd/loss/bwd/opt."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch_geometric")
+    from torch_geometric.data import Data
+
+    from src.models import AdaptiveFocalLoss
+    from src.training.train import build_gnn_model, gnn_train_step
+
+    data = Data(
+        x=torch.randn(8, 9),
+        edge_index=torch.tensor([[0, 1, 2, 3, 4, 5], [1, 2, 3, 4, 5, 0]]),
+        edge_attr=torch.randn(6, 2),
+        y=torch.tensor([0, 1, 0, 0, 1, 0, 0, 1]),
+    )
+    data.batch_size = 4
+    for arch in ("gatv2", "graphsage"):
+        model = build_gnn_model(arch, in_channels=9, hidden_channels=16, num_layers=1)
+        before = [p.detach().clone() for p in model.parameters()]
+        criterion = AdaptiveFocalLoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        info = gnn_train_step(model, data, criterion, optimizer)
+        assert info["loss"] == info["loss"]  # finite
+        assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters()))
+
+
+def test_kaggle_plugin_falls_back_without_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery 'kaggle' plugin auto-falls-back to public HF (no manual creds)."""
+    monkeypatch.delenv("KAGGLE_USERNAME", raising=False)
+    monkeypatch.delenv("KAGGLE_KEY", raising=False)
+    monkeypatch.setattr(AUTO_FETCH, "search_huggingface", lambda query, **kw: [])
+    assert AUTO_FETCH._PROVIDERS["kaggle"]("bitcoin laundering") == []
 
 
 def test_search_kaggle_import_failure_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:

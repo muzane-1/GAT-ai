@@ -18,12 +18,102 @@ import torch
 from sklearn.model_selection import train_test_split
 from torch import nn
 
-from src.models import AdaptiveFocalLoss, GATv2GraphTransformer, GATv2Net
+from src.models import AdaptiveFocalLoss, GATv2GraphTransformer, GATv2Net, GraphSAGE
 from src.pipeline import build_pyg_data, fetch_transactions
 from src.utils import format_metrics, get_logger, load_config
 from src.utils.metrics import compute_metrics
 
 logger = get_logger(__name__)
+
+
+def build_gnn_model(
+    architecture: str,
+    *,
+    in_channels: int,
+    hidden_channels: int = 64,
+    num_layers: int = 3,
+    heads: int = 4,
+    dropout: float = 0.3,
+    concat_heads: bool = True,
+    edge_dim: int | None = None,
+    lap_pe_dim: int = 0,
+    rw_pe_dim: int = 0,
+    num_classes: int = 2,
+) -> nn.Module:
+    """Instantiate a GNN classifier dynamically from ``config/config.yaml``.
+
+    Supported ``architecture`` values: ``gatv2`` (default), ``hybrid``
+    (GATv2 + graph transformer) and ``graphsage``.
+    """
+    name = str(architecture or "gatv2").lower()
+    if name == "hybrid":
+        return GATv2GraphTransformer(
+            in_channels=in_channels,
+            hidden_channels=hidden_channels,
+            num_layers=num_layers,
+            heads=heads,
+            dropout=dropout,
+            edge_dim=edge_dim,
+            lap_pe_dim=lap_pe_dim,
+            rw_pe_dim=rw_pe_dim,
+            num_classes=num_classes,
+        )
+    if name in {"graphsage", "sage", "graph_sage"}:
+        return GraphSAGE(
+            in_channels=in_channels,
+            hidden_channels=hidden_channels,
+            num_layers=num_layers,
+            dropout=dropout,
+            num_classes=num_classes,
+        )
+    return GATv2Net(
+        in_channels=in_channels,
+        hidden_channels=hidden_channels,
+        num_layers=num_layers,
+        heads=heads,
+        dropout=dropout,
+        concat_heads=concat_heads,
+        edge_dim=edge_dim,
+        num_classes=num_classes,
+    )
+
+
+def gnn_train_step(
+    model: nn.Module,
+    batch: Any,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    *,
+    grad_clip_norm: float = 1.0,
+) -> dict[str, float]:
+    """Execute one mini-batch GNN training step (Steps 5-6 of the pipeline).
+
+    Runs the full forward pass on a PyG ``NeighborLoader`` mini-batch,
+    computes :class:`AdaptiveFocalLoss`, calls ``loss.backward()`` and applies
+    the optimizer update.  Returns ``{"loss", "grad_norm", "nodes"}``.
+    """
+    model.train()
+    optimizer.zero_grad()
+    edge_attr = getattr(batch, "edge_attr", None)
+    lap_pe = getattr(batch, "lap_pe", None)
+    rw_pe = getattr(batch, "rw_pe", None)
+    kwargs: dict[str, Any] = {}
+    if isinstance(model, GATv2GraphTransformer):
+        kwargs = {"lap_pe": lap_pe, "rw_pe": rw_pe}
+    logits = (
+        model(batch.x, batch.edge_index, edge_attr, **kwargs)
+        if kwargs
+        else model(batch.x, batch.edge_index, edge_attr)
+    )
+    # NeighborLoader batches carry the seed-node count in batch_size.
+    n_seed = int(getattr(batch, "batch_size", batch.num_nodes))
+    targets = batch.y[:n_seed] if batch.y.shape[0] >= n_seed else batch.y
+    logits = logits[: int(targets.shape[0])]
+    loss = criterion(logits, targets)
+    loss.backward()
+    grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm))
+    optimizer.step()
+    return {"loss": float(loss.item()), "grad_norm": grad_norm, "nodes": int(targets.shape[0])}
 
 
 def make_masks(y: torch.Tensor, val_ratio: float, test_ratio: float, seed: int) -> tuple:
@@ -169,27 +259,19 @@ def train_model(
     )
 
     edge_dim = int(data.edge_attr.shape[1]) if model_cfg.get("use_edge_features", True) else None
-    if model_cfg.get("architecture", "gatv2") == "hybrid":
-        model: nn.Module = GATv2GraphTransformer(
-            in_channels=data.num_features,
-            hidden_channels=model_cfg["hidden_channels"],
-            num_layers=model_cfg["num_layers"],
-            heads=model_cfg["heads"],
-            dropout=model_cfg["dropout"],
-            edge_dim=edge_dim,
-            lap_pe_dim=data.lap_pe.size(1),
-            rw_pe_dim=data.rw_pe.size(1),
-        )
-    else:
-        model = GATv2Net(
-            in_channels=data.num_features,
-            hidden_channels=model_cfg["hidden_channels"],
-            num_layers=model_cfg["num_layers"],
-            heads=model_cfg["heads"],
-            dropout=model_cfg["dropout"],
-            concat_heads=model_cfg.get("concat_heads", True),
-            edge_dim=edge_dim,
-        )
+    # Step 5: instantiate the GNN dynamically from config (gatv2/hybrid/graphsage).
+    model: nn.Module = build_gnn_model(
+        str(model_cfg.get("architecture", "gatv2")),
+        in_channels=data.num_features,
+        hidden_channels=model_cfg["hidden_channels"],
+        num_layers=model_cfg["num_layers"],
+        heads=model_cfg["heads"],
+        dropout=model_cfg["dropout"],
+        concat_heads=model_cfg.get("concat_heads", True),
+        edge_dim=edge_dim,
+        lap_pe_dim=data.lap_pe.size(1),
+        rw_pe_dim=data.rw_pe.size(1),
+    )
     criterion = AdaptiveFocalLoss(
         init_alpha=loss_cfg["init_alpha"],
         init_gamma=loss_cfg["init_gamma"],
