@@ -651,7 +651,9 @@ def search_web_resilient(
     return search_web_browser(query, limit=limit)
 
 
-def _huggingface_plugin(query: str, *, limit: int = 8, timeout: float = 15.0) -> list[DatasetCandidate]:
+def _huggingface_plugin(
+    query: str, *, limit: int = 8, timeout: float = 15.0
+) -> list[DatasetCandidate]:
     """Hugging Face plugin entry: split fan-out + full-text backup on zero recall."""
     results = search_huggingface_split(query, limit=limit, timeout=timeout)
     if not results:
@@ -2197,9 +2199,7 @@ def auto_fetch(
 
                 # Select the highest-scoring dataset that passes hard validation checks
                 for dataset_id in ordered_ids:
-                    evaluation_scores = next(
-                        s for d, s, _ in evaluated_datasets if d == dataset_id
-                    )
+                    evaluation_scores = next(s for d, s, _ in evaluated_datasets if d == dataset_id)
                     df_raw = raw_by_id[dataset_id]
                     try:
                         df = sanitize_transactions(df_raw)

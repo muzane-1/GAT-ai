@@ -195,11 +195,11 @@ def test_search_kaggle_requires_credentials(monkeypatch: pytest.MonkeyPatch) -> 
     assert AUTO_FETCH.search_kaggle("bitcoin laundering") == []
     # Automated fallback: missing creds -> public Hugging Face AML datasets.
     sentinel = [
-        AUTO_FETCH.DatasetCandidate(id="huggingface:a/b", provider="huggingface", title="t", url="u")
+        AUTO_FETCH.DatasetCandidate(
+            id="huggingface:a/b", provider="huggingface", title="t", url="u"
+        )
     ]
-    monkeypatch.setattr(
-        AUTO_FETCH, "search_huggingface_split", lambda query, **kwargs: sentinel
-    )
+    monkeypatch.setattr(AUTO_FETCH, "search_huggingface_split", lambda query, **kwargs: sentinel)
     candidates, provider = AUTO_FETCH.search_kaggle_with_fallback("bitcoin laundering")
     assert provider == "huggingface"
     assert candidates == sentinel
@@ -228,7 +228,7 @@ def test_search_huggingface_split_fans_out_keywords(
     """Split search fans each keyword out and de-duplicates merged results."""
     calls: list[str] = []
 
-    def _fake_search(query: str, *, limit: int = 8, timeout: float = 15.0):
+    def _fake_search(query: str, *, limit: int = 8, timeout: float = 15.0) -> list:
         calls.append(query)
         return [
             AUTO_FETCH.DatasetCandidate(
@@ -294,7 +294,7 @@ def test_transform_to_PyG_validates_and_builds_graph() -> None:
     data, _scaler, info = AUTO_FETCH.transform_to_PyG(frame)
     assert data.num_nodes == 3 and data.num_edges == 3
     assert data.x.shape[1] == 9  # FEATURE_COLUMNS incl. degree features
-    assert getattr(data, "lap_pe") is not None and getattr(data, "rw_pe") is not None
+    assert data.lap_pe is not None and data.rw_pe is not None
     assert info["num_nodes"] == 3
 
 
@@ -327,7 +327,7 @@ def test_gnn_train_step_and_model_factory() -> None:
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         info = gnn_train_step(model, data, criterion, optimizer)
         assert info["loss"] == info["loss"]  # finite
-        assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters()))
+        assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters(), strict=False))
 
 
 def test_kaggle_plugin_falls_back_without_credentials(
@@ -416,8 +416,9 @@ def test_list_candidate_datasets_uses_generated_keywords(monkeypatch: pytest.Mon
 
     datasets = AUTO_FETCH.list_candidate_datasets()
     assert datasets == ["acme/always-pass"]
-    search = api.list_datasets.call_args.kwargs["search"]
-    assert "bitcoin" in search
+    # First query should be a generated keyword (e.g. "bitcoin").
+    first_search = api.list_datasets.call_args_list[0].kwargs["search"]
+    assert "bitcoin" in first_search
 
 
 def test_list_candidate_datasets_merges_extra_providers(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -2,6 +2,7 @@
 
 from importlib import import_module
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pytest
@@ -24,6 +25,7 @@ def _candidate(cid: str, provider: str) -> AUTO_FETCH.DatasetCandidate:
         id=cid, provider=provider, title=cid, url=f"https://example.test/{cid}"
     )
 
+
 def test_fully_automated_real_loop_no_human_intervention(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -32,16 +34,14 @@ def test_fully_automated_real_loop_no_human_intervention(
     good = _candidate("huggingface:acme/aml-good", "huggingface")
     mediocre = _candidate("github:acme/aml-ok", "github")
     bad = _candidate("web:acme/aml-bad", "web")
-    monkeypatch.setattr(
-        AUTO_FETCH, "discover_candidates", lambda **kwargs: [bad, mediocre, good]
-    )
+    monkeypatch.setattr(AUTO_FETCH, "discover_candidates", lambda **kwargs: [bad, mediocre, good])
     frames = {
         good.id: _realistic_frame(40),
         mediocre.id: _realistic_frame(40).assign(is_laundering=0),
         bad.id: pd.DataFrame({"a": [1, 2], "b": [3, 4]}),
     }
 
-    def _fake_verify(candidates, download_dir, **kwargs):
+    def _fake_verify(candidates: list, download_dir: Path | str, **kwargs: Any) -> list:
         out = []
         for cand in candidates:
             raw = frames[cand.id]
@@ -82,7 +82,7 @@ def test_fully_automated_real_loop_no_human_intervention(
     before = [p.detach().clone() for p in model.parameters()]
     step = gnn_train_step(model, batch, criterion, optimizer)
     assert step["loss"] == step["loss"]
-    assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters()))
+    assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters(), strict=False))
     AUTO_FETCH._discovery_cache.clear()
 
 
@@ -94,7 +94,7 @@ def test_auto_loop_falls_back_without_humans(
     only = _candidate("github:acme/weak", "github")
     monkeypatch.setattr(AUTO_FETCH, "discover_candidates", lambda **kwargs: [only])
 
-    def _fake_verify(candidates, download_dir, **kwargs):
+    def _fake_verify(candidates: list, download_dir: Path | str, **kwargs: Any) -> list:
         raw = pd.DataFrame({"a": [1], "b": [2]})
         item = AUTO_FETCH.VerifiedDataset(
             only, AUTO_FETCH.assess_reliability(only, df=None), tmp_path, raw
@@ -102,9 +102,7 @@ def test_auto_loop_falls_back_without_humans(
         return [item]
 
     monkeypatch.setattr(AUTO_FETCH, "verify_candidates", _fake_verify)
-    result = AUTO_FETCH.auto_discover_source(
-        top_k=1, download_dir=tmp_path, min_quality=100.0
-    )
+    result = AUTO_FETCH.auto_discover_source(top_k=1, download_dir=tmp_path, min_quality=100.0)
     assert result["status"] == "fallback_real"
     assert result["candidate"].id == only.id
     monkeypatch.setattr(AUTO_FETCH, "verify_candidates", lambda *a, **k: [])

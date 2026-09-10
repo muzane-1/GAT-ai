@@ -19,6 +19,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import torch
 import torch.nn.functional as F
 import yaml
@@ -26,13 +27,7 @@ from torch_geometric import typing as pyg_typing
 from torch_geometric.loader import DataLoader, NeighborLoader
 
 from src.models import AdaptiveFocalLoss
-from src.pipeline.discovery.auto_fetch import (
-    auto_discover_source,
-    discover_candidates,
-    score_data_source_quality,
-    select_source,
-    transform_to_PyG,
-)
+from src.pipeline.discovery.auto_fetch import auto_discover_source, transform_to_PyG
 from src.pipeline.validation.pandera_schema import validate_transaction_schema
 from src.training.train import build_gnn_model, gnn_train_step
 
@@ -71,8 +66,6 @@ def _fetch_real_candidates(
 
         df = fetch_transactions(source=source, fallback_generate=False)
         return df, {"provenance": f"source:{source}", "selection": "explicit"}
-
-    from src.pipeline.discovery.auto_fetch import auto_discover_source
 
     result = auto_discover_source(top_k=limit)
     if result["status"] in ("selected", "fallback_real") and result.get("raw_df") is not None:

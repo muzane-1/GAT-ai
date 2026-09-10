@@ -8,6 +8,7 @@ row) is flagged, the table carries little discriminative signal.
 
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from src.pipeline.validation.schema import resolve_column
@@ -20,7 +21,7 @@ def evaluate_graph_topology(df: pd.DataFrame) -> dict[str, Any]:
         df: Raw transaction table.
 
     Returns:
-        Dict with ``score`` (0..1-ish graph-size proxy, kept compatible with
+        Dict with ``score`` (0..1 graph-size proxy, kept compatible with
         the earlier pipeline), ``nodes``, ``edges``, ``connectivity_ratio``,
         ``aml_ratio``, ``aml_balance`` and ``non_zero_aml`` boolean.
     """
@@ -37,7 +38,11 @@ def evaluate_graph_topology(df: pd.DataFrame) -> dict[str, Any]:
         if nodes > 0 and edges > 0:
             connectivity_ratio = round(min(1.0, edges / nodes), 6)
 
-    graph_score = (nodes + edges + connectivity_ratio) / 3.0 if (nodes > 0 and edges > 0) else 0.0
+    # Normalize graph size to a 0-1 score using log scale so large graphs
+    # don't dominate the weighted score.
+    node_score = float(np.log1p(nodes) / np.log1p(1000)) if nodes > 0 else 0.0
+    edge_score = float(np.log1p(edges) / np.log1p(10000)) if edges > 0 else 0.0
+    graph_score = (node_score + edge_score + connectivity_ratio) / 3.0
 
     aml_col = resolve_column(df, "is_laundering")
     aml_ratio = 0.0
