@@ -26,6 +26,10 @@ GAT-ai/
 ├── config/
 │   └── config.yaml              # Single source of truth: model, loss, training, data, monitoring
 ├── data/                        # (gitignored) raw / discovery / processed artifacts
+├── infra/                       # Modal cloud shell (decoupled from src/ training logic)
+│   ├── image_builder.py         # Pre-built GPU image (Torch CUDA + PyG + Pandera + Neo4j)
+│   ├── volume_sync.py           # Sync data/processed/ -> aml-gnn-data-vol cloud volume
+│   └── secrets_manager.py       # modal.Secret handles for HF tokens + Neo4j credentials
 ├── scripts/
 │   ├── update_pipeline.py       # Checkpoint registry + metric drift + retrain trigger
 │   └── verify_readiness.py      # Deterministic end-to-end readiness check
